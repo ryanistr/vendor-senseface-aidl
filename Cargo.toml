@@ -1,0 +1,26 @@
+[package]
+name = "face-hal"
+version = "1.0.0"
+edition = "2021"
+
+# The staged filename is android.hardware.biometrics.face-service, but a Rust
+# crate/bin name cannot contain '.', so the crate builds as face-hal-service and
+# scripts/stage_vendor.sh installs it under the real name.
+[[bin]]
+name = "face-hal-service"
+path = "src/main.rs"
+
+[dependencies]
+rsbinder = { version = "0.6.0", features = ["android_14"] }
+async-trait = "0.1"
+libc = "0.2"
+
+[build-dependencies]
+rsbinder-aidl = "=0.6.0"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
