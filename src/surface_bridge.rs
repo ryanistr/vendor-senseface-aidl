@@ -8,9 +8,7 @@ use std::sync::Mutex;
 use crate::logging;
 
 const RTLD_NOW: c_int = 2;
-const WINDOW_FORMAT_RGBA_8888: i32 = 1;
-const TARGET_WIDTH: i32 = 480;
-const TARGET_HEIGHT: i32 = 640;
+const RTLD_GLOBAL: c_int = 0x100;
 
 extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
@@ -61,24 +59,15 @@ extern "C" {
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
 }
 
-type FnOperatorNew = unsafe extern "C" fn(usize) -> *mut c_void;
-type FnOperatorDelete = unsafe extern "C" fn(*mut c_void);
-type FnH2bCtor = unsafe extern "C" fn(this: *mut c_void, base_sp: *const *mut c_void);
-type FnSurfaceCtor = unsafe extern "C" fn(
-    this: *mut c_void,
-    producer_sp: *const *mut c_void,
-    controlled_by_app: bool,
-    surface_control_sp: *const *mut c_void,
-);
-type FnRefBaseIncStrong = unsafe extern "C" fn(this: *const c_void, id: *const c_void);
-type FnRefBaseDecStrong = unsafe extern "C" fn(this: *const c_void, id: *const c_void);
+type FnGetNativeWindow = unsafe extern "C" fn(holder: *mut c_void) -> *mut c_void;
+type FnDestroySurfaceHolder = unsafe extern "C" fn(holder: *mut c_void);
 
 unsafe impl Send for SurfaceBridge {}
 
 pub struct SurfaceBridge {
+    holder: *mut c_void,
     native_window: *mut c_void,
-    surface: *mut c_void,
-    fn_dec_strong: Option<FnRefBaseDecStrong>,
+    fn_destroy: Option<FnDestroySurfaceHolder>,
     frames: u64,
     fail_count: u64,
 }
@@ -91,7 +80,7 @@ fn load_lib(paths: &[&str]) -> Option<*mut c_void> {
             Ok(c) => c,
             Err(_) => continue,
         };
-        let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW) };
+        let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
         if !h.is_null() {
             logging::info(&format!("preview: loaded {}", p));
             return Some(h);
@@ -185,6 +174,37 @@ unsafe fn call_cast_from(f: *mut c_void, base: *const *mut c_void) -> *mut c_voi
     *(ret.as_ptr().add(0x28 / 8) as *const *mut c_void)
 }
 
+// Calls getSurfaceFromHGBP which returns sp<SurfaceHolder> with indirect result pointer in x8
+#[inline(always)]
+unsafe fn call_get_surface(f: *mut c_void, producer_sp: *const *mut c_void) -> *mut c_void {
+    let mut ret = [0u64; 2];
+    core::arch::asm!(
+        "blr {fn_ptr}",
+        fn_ptr = in(reg) f,
+        in("x0") producer_sp,
+        in("x8") ret.as_mut_ptr(),
+        lateout("x1") _,
+        lateout("x2") _,
+        lateout("x3") _,
+        lateout("x4") _,
+        lateout("x5") _,
+        lateout("x6") _,
+        lateout("x7") _,
+        lateout("x9") _,
+        lateout("x10") _,
+        lateout("x11") _,
+        lateout("x12") _,
+        lateout("x13") _,
+        lateout("x14") _,
+        lateout("x15") _,
+        lateout("x16") _,
+        lateout("x17") _,
+        lateout("x30") _,
+        options(nostack)
+    );
+    ret[0] as *mut c_void
+}
+
 fn is_valid_native_window(anw: *mut c_void) -> bool {
     if anw.is_null() {
         return false;
@@ -200,61 +220,6 @@ fn is_valid_native_window(anw: *mut c_void) -> bool {
     }
 }
 
-// Scans libgui .text for the H2BGraphicBufferProducer constructor prologue
-fn find_h2b_ctor(libgui_base: usize, is_v1: bool) -> Option<FnH2bCtor> {
-    const PATTERN: [u8; 24] = [
-        0xfd, 0x7b, 0xbe, 0xa9,
-        0xf4, 0x4f, 0x01, 0xa9,
-        0xfd, 0x03, 0x00, 0x91,
-        0xf4, 0x03, 0x00, 0xaa,
-        0x00, 0xa0, 0x01, 0x91,
-        0xf3, 0x03, 0x01, 0xaa,
-    ];
-
-    // Scan within .text segment boundaries (0xa0000..0x160000)
-    let start_offset = 0x0a0000usize;
-    let end_offset = 0x160000usize;
-    let slice = unsafe { std::slice::from_raw_parts((libgui_base + start_offset) as *const u8, end_offset - start_offset) };
-
-    let mut matches = Vec::new();
-    let mut offset = 0usize;
-    while offset + PATTERN.len() <= slice.len() {
-        if &slice[offset..offset + PATTERN.len()] == &PATTERN {
-            matches.push(libgui_base + start_offset + offset);
-            offset += PATTERN.len();
-            if matches.len() >= 2 {
-                break;
-            }
-        } else {
-            offset += 4;
-        }
-    }
-
-    logging::info(&format!(
-        "preview: found {} H2B constructor pattern matches: {:?}",
-        matches.len(),
-        matches.iter().map(|m| format!("{:#x}", m)).collect::<Vec<_>>()
-    ));
-
-    let chosen_addr = if matches.len() >= 2 {
-        if is_v1 { matches[1] } else { matches[0] }
-    } else if matches.len() == 1 {
-        matches[0]
-    } else {
-        // Hardcoded offsets for Android 15 libgui if scan fails
-        let fallback_rel = if is_v1 { 0x115c50usize } else { 0x115b80usize };
-        libgui_base + fallback_rel
-    };
-
-    logging::info(&format!(
-        "preview: selected H2B constructor at {:#x} (mode: {})",
-        chosen_addr,
-        if is_v1 { "V1_0" } else { "V2_0" }
-    ));
-
-    Some(unsafe { std::mem::transmute::<usize, FnH2bCtor>(chosen_addr) })
-}
-
 impl SurfaceBridge {
     pub fn create(token: &[u8]) -> Option<SurfaceBridge> {
         if token.is_empty() {
@@ -265,7 +230,6 @@ impl SurfaceBridge {
         let token_utils = load_lib(&[
             "/apex/com.android.vndk.v31/lib64/android.hidl.token@1.0-utils.so",
             "/apex/com.android.vndk.v31@1/lib64/android.hidl.token@1.0-utils.so",
-            "/system/lib64/android.hidl.token@1.0-utils.so",
             "android.hidl.token@1.0-utils.so",
         ])?;
 
@@ -291,7 +255,7 @@ impl SurfaceBridge {
         for (libs, sym, v1) in [
             (
                 &[
-                    "/system/lib64/android.hardware.graphics.bufferqueue@2.0.so",
+                    "/apex/com.android.vndk.v31/lib64/android.hardware.graphics.bufferqueue@2.0.so",
                     "android.hardware.graphics.bufferqueue@2.0.so",
                 ][..],
                 "_ZN7android8hardware8graphics11bufferqueue4V2_022IGraphicBufferProducer8castFromERKNS_2spINS_4hidl4base4V1_05IBaseEEEb",
@@ -299,7 +263,7 @@ impl SurfaceBridge {
             ),
             (
                 &[
-                    "/system/lib64/android.hardware.graphics.bufferqueue@1.0.so",
+                    "/apex/com.android.vndk.v31/lib64/android.hardware.graphics.bufferqueue@1.0.so",
                     "android.hardware.graphics.bufferqueue@1.0.so",
                 ][..],
                 "_ZN7android8hardware8graphics11bufferqueue4V1_022IGraphicBufferProducer8castFromERKNS_2spINS_4hidl4base4V1_05IBaseEEEb",
@@ -327,17 +291,20 @@ impl SurfaceBridge {
             return None;
         }
 
-        let libgui = load_lib(&[
-            "/system/lib64/libgui.so",
-            "libgui.so",
+        let conv = load_lib(&[
+            "/apex/com.android.vndk.v31/lib64/libbufferqueueconverter.so",
+            "libbufferqueueconverter.so",
         ])?;
 
-        let surface_ctor_sym = symbol(
-            libgui,
-            "_ZN7android7SurfaceC1ERKNS_2spINS_22IGraphicBufferProducerEEEbRKNS1_INS_7IBinderEEE",
+        let fn_get_surface = symbol(
+            conv,
+            "_ZN7android18getSurfaceFromHGBPERKNS_2spINS_8hardware8graphics11bufferqueue4V2_022IGraphicBufferProducerEEE",
         )?;
-        let fn_surface_ctor: FnSurfaceCtor = unsafe {
-            std::mem::transmute(surface_ctor_sym)
+        let fn_get_native: FnGetNativeWindow = unsafe {
+            std::mem::transmute(symbol(conv, "_ZN7android15getNativeWindowEPNS_13SurfaceHolderE")?)
+        };
+        let fn_destroy: FnDestroySurfaceHolder = unsafe {
+            std::mem::transmute(symbol(conv, "_ZN7android20destroySurfaceHolderEPNS_13SurfaceHolderE")?)
         };
 
         let mut dlinfo = DlInfo {
@@ -346,62 +313,90 @@ impl SurfaceBridge {
             dli_sname: ptr::null(),
             dli_saddr: ptr::null_mut(),
         };
-        let dladdr_res = unsafe { dladdr(surface_ctor_sym, &mut dlinfo) };
+        let dladdr_res = unsafe { dladdr(fn_get_surface, &mut dlinfo) };
         if dladdr_res == 0 || dlinfo.dli_fbase.is_null() {
-            logging::error("preview: dladdr failed for libgui.so base");
+            logging::error("preview: dladdr failed for libbufferqueueconverter.so base");
             return None;
         }
-        let libgui_base = dlinfo.dli_fbase as usize;
-        logging::info(&format!("preview: libgui base address: {:#x}", libgui_base));
+        let conv_base = dlinfo.dli_fbase as usize;
+        logging::info(&format!("preview: libbufferqueueconverter base address: {:#x}", conv_base));
 
-        let h2b_ctor = find_h2b_ctor(libgui_base, is_v1)?;
+        // When producer is V1_0, patch libbufferqueueconverter's GOT to use V1_0 H2BGraphicBufferProducer
+        // GOT slots 0x2240 (ZTT) and 0x2248 (ZTV).
+        let mut orig_ztt: usize = 0;
+        let mut orig_ztv: usize = 0;
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let got_page = (conv_base + 0x2000) & !(page_size - 1);
 
-        let libutils = load_lib(&["libutils.so", "/system/lib64/libutils.so"])?;
-        let fn_inc_strong: FnRefBaseIncStrong = unsafe {
-            std::mem::transmute(symbol(libutils, "_ZNK7android7RefBase9incStrongEPKv")?)
-        };
-        let fn_dec_strong: FnRefBaseDecStrong = unsafe {
-            std::mem::transmute(symbol(libutils, "_ZNK7android7RefBase9decStrongEPKv")?)
-        };
+        if is_v1 {
+            let got_ztt_ptr = (conv_base + 0x2240) as *mut usize;
+            let got_ztv_ptr = (conv_base + 0x2248) as *mut usize;
+            unsafe {
+                orig_ztt = *got_ztt_ptr;
+                orig_ztv = *got_ztv_ptr;
+            }
 
-        let libcxx = load_lib(&["libc++.so"])?;
-        let fn_new: FnOperatorNew = unsafe {
-            std::mem::transmute(symbol(libcxx, "_Znwm")?)
-        };
+            // Derive libgui.so base address from original GOT[0x2240] (which points to libgui V2_0 ZTT at offset 0x119880)
+            let libgui_base = orig_ztt.wrapping_sub(0x119880);
+            let ztt_v1 = libgui_base + 0x1197b0;
+            let ztv_v1 = libgui_base + 0x112188;
 
-        // Allocate 120 bytes for H2BGraphicBufferProducer
-        let h2b_mem = unsafe { fn_new(120) };
-        if h2b_mem.is_null() {
-            logging::error("preview: failed to allocate H2BGraphicBufferProducer");
-            return None;
+            logging::info(&format!(
+                "preview: patching GOT (libgui_base={:#x}, ztt={:#x}, ztv={:#x})",
+                libgui_base, ztt_v1, ztv_v1
+            ));
+
+            let mprot_rw = unsafe {
+                libc::mprotect(
+                    got_page as *mut c_void,
+                    page_size * 2,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            };
+            if mprot_rw == 0 {
+                unsafe {
+                    *got_ztt_ptr = ztt_v1;
+                    *got_ztv_ptr = ztv_v1;
+                    libc::mprotect(got_page as *mut c_void, page_size * 2, libc::PROT_READ);
+                }
+                logging::info("preview: patched GOT for V1_0 producer");
+            } else {
+                logging::error("preview: failed to make GOT writable");
+            }
         }
 
-        // Construct H2BGraphicBufferProducer directly
         let producer_ptr = producer;
-        unsafe { h2b_ctor(h2b_mem, &producer_ptr) };
-        logging::info(&format!("preview: constructed H2BGraphicBufferProducer at {:#x}", h2b_mem as usize));
+        let holder = unsafe { call_get_surface(fn_get_surface, &producer_ptr) };
 
-        // Allocate 8352 bytes for Surface (Android 15 sizeof(Surface))
-        let surface_mem = unsafe { fn_new(8352) };
-        if surface_mem.is_null() {
-            logging::error("preview: failed to allocate Surface");
+        // Restore GOT if patched
+        if is_v1 && orig_ztt != 0 {
+            let got_ztt_ptr = (conv_base + 0x2240) as *mut usize;
+            let got_ztv_ptr = (conv_base + 0x2248) as *mut usize;
+            if unsafe {
+                libc::mprotect(
+                    got_page as *mut c_void,
+                    page_size * 2,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            } == 0 {
+                unsafe {
+                    *got_ztt_ptr = orig_ztt;
+                    *got_ztv_ptr = orig_ztv;
+                    libc::mprotect(got_page as *mut c_void, page_size * 2, libc::PROT_READ);
+                }
+            }
+        }
+
+        if holder.is_null() {
+            logging::error("preview: getSurfaceFromHGBP returned null");
             return None;
         }
+        logging::info(&format!("preview: obtained SurfaceHolder at {:#x}", holder as usize));
 
-        // Construct Surface
-        let null_binder: *mut c_void = ptr::null_mut();
-        let h2b_sp = h2b_mem;
-        unsafe {
-            fn_surface_ctor(surface_mem, &h2b_sp, true, &null_binder);
-            fn_inc_strong(surface_mem, surface_mem);
-        }
-        logging::info(&format!("preview: constructed Surface at {:#x}", surface_mem as usize));
-
-        // ANativeWindow interface is located at surface + 0x10
-        let anw = unsafe { (surface_mem as *mut u8).add(0x10) as *mut c_void };
+        let anw = unsafe { fn_get_native(holder) };
         if !is_valid_native_window(anw) {
             logging::error(&format!("preview: invalid ANativeWindow pointer at {:#x}", anw as usize));
-            unsafe { fn_dec_strong(surface_mem, surface_mem) };
+            unsafe { fn_destroy(holder) };
             return None;
         }
         logging::info(&format!("preview: validated ANativeWindow at {:#x}", anw as usize));
@@ -417,12 +412,12 @@ impl SurfaceBridge {
             }
         }
 
-        logging::info("preview: surface bridge successfully established");
+        logging::info("preview: surface bridge successfully established via libbufferqueueconverter");
 
         Some(SurfaceBridge {
+            holder,
             native_window: anw,
-            surface: surface_mem,
-            fn_dec_strong: Some(fn_dec_strong),
+            fn_destroy: Some(fn_destroy),
             frames: 0,
             fail_count: 0,
         })
@@ -523,11 +518,11 @@ impl SurfaceBridge {
 
 impl Drop for SurfaceBridge {
     fn drop(&mut self) {
-        if !self.surface.is_null() {
-            if let Some(dec) = self.fn_dec_strong {
-                unsafe { dec(self.surface, self.surface) };
+        if !self.holder.is_null() {
+            if let Some(destroy) = self.fn_destroy {
+                unsafe { destroy(self.holder) };
             }
-            self.surface = ptr::null_mut();
+            self.holder = ptr::null_mut();
             self.native_window = ptr::null_mut();
         }
     }

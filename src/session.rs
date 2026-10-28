@@ -26,7 +26,7 @@ use crate::bindings::android::hardware::keymaster::HardwareAuthToken::HardwareAu
 use crate::bindings::android::hardware::common::NativeHandle::NativeHandle;
 use crate::camera::{CameraEngine, CAPTURE_HEIGHT, CAPTURE_WIDTH};
 use crate::logging::{self, get_prop};
-use crate::stface::{self, EnrollOutcome, StFace, CAMERA_CHOOSE_PATH};
+use crate::stface::{EnrollOutcome, StFace, CAMERA_CHOOSE_PATH};
 use crate::surface_bridge;
 
 /// The algorithm library is process-global; both sessions and the service entry
