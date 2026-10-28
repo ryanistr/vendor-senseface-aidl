@@ -329,39 +329,47 @@ impl SurfaceBridge {
         let got_page = (conv_base + 0x2000) & !(page_size - 1);
 
         if is_v1 {
-            let got_ztt_ptr = (conv_base + 0x2240) as *mut usize;
-            let got_ztv_ptr = (conv_base + 0x2248) as *mut usize;
-            unsafe {
-                orig_ztt = *got_ztt_ptr;
-                orig_ztv = *got_ztv_ptr;
-            }
+            let ztt_v1 = symbol(
+                ptr::null_mut(),
+                "_ZTTN7android8hardware8graphics11bufferqueue4V1_05utils24H2BGraphicBufferProducerE",
+            );
+            let ztv_v1 = symbol(
+                ptr::null_mut(),
+                "_ZTVN7android8hardware8graphics11bufferqueue4V1_05utils24H2BGraphicBufferProducerE",
+            );
 
-            // Derive libgui.so base address from original GOT[0x2240] (which points to libgui V2_0 ZTT at offset 0x119880)
-            let libgui_base = orig_ztt.wrapping_sub(0x119880);
-            let ztt_v1 = libgui_base + 0x1197b0;
-            let ztv_v1 = libgui_base + 0x112188;
-
-            logging::info(&format!(
-                "preview: patching GOT (libgui_base={:#x}, ztt={:#x}, ztv={:#x})",
-                libgui_base, ztt_v1, ztv_v1
-            ));
-
-            let mprot_rw = unsafe {
-                libc::mprotect(
-                    got_page as *mut c_void,
-                    page_size * 2,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                )
-            };
-            if mprot_rw == 0 {
+            if let (Some(ztt), Some(ztv)) = (ztt_v1, ztv_v1) {
+                let got_ztt_ptr = (conv_base + 0x2240) as *mut usize;
+                let got_ztv_ptr = (conv_base + 0x2248) as *mut usize;
                 unsafe {
-                    *got_ztt_ptr = ztt_v1;
-                    *got_ztv_ptr = ztv_v1;
-                    libc::mprotect(got_page as *mut c_void, page_size * 2, libc::PROT_READ);
+                    orig_ztt = *got_ztt_ptr;
+                    orig_ztv = *got_ztv_ptr;
                 }
-                logging::info("preview: patched GOT for V1_0 producer");
+
+                logging::info(&format!(
+                    "preview: patching GOT (orig_ztt={:#x}, ztt_v1={:#x}, orig_ztv={:#x}, ztv_v1={:#x})",
+                    orig_ztt, ztt as usize, orig_ztv, ztv as usize
+                ));
+
+                let mprot_rw = unsafe {
+                    libc::mprotect(
+                        got_page as *mut c_void,
+                        page_size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                    )
+                };
+                if mprot_rw == 0 {
+                    unsafe {
+                        *got_ztt_ptr = ztt as usize;
+                        *got_ztv_ptr = ztv as usize;
+                        libc::mprotect(got_page as *mut c_void, page_size, libc::PROT_READ);
+                    }
+                    logging::info("preview: patched GOT for V1_0 producer");
+                } else {
+                    logging::error("preview: failed to make GOT writable");
+                }
             } else {
-                logging::error("preview: failed to make GOT writable");
+                logging::error("preview: could not resolve V1_0 ZTT/ZTV symbols");
             }
         }
 
@@ -375,15 +383,16 @@ impl SurfaceBridge {
             if unsafe {
                 libc::mprotect(
                     got_page as *mut c_void,
-                    page_size * 2,
+                    page_size,
                     libc::PROT_READ | libc::PROT_WRITE,
                 )
             } == 0 {
                 unsafe {
                     *got_ztt_ptr = orig_ztt;
                     *got_ztv_ptr = orig_ztv;
-                    libc::mprotect(got_page as *mut c_void, page_size * 2, libc::PROT_READ);
+                    libc::mprotect(got_page as *mut c_void, page_size, libc::PROT_READ);
                 }
+                logging::info("preview: restored GOT");
             }
         }
 
