@@ -59,6 +59,133 @@ extern "C" {
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
 }
 
+#[repr(C)]
+struct Elf64_Ehdr {
+    e_ident: [u8; 16],
+    e_type: u16,
+    e_machine: u16,
+    e_version: u32,
+    e_entry: u64,
+    e_phoff: u64,
+    e_shoff: u64,
+    e_flags: u32,
+    e_ehsize: u16,
+    e_phentsize: u16,
+    e_phnum: u16,
+    e_shentsize: u16,
+    e_shnum: u16,
+    e_shstrndx: u16,
+}
+
+#[repr(C)]
+struct Elf64_Phdr {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_paddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+}
+
+#[repr(C)]
+struct Elf64_Dyn {
+    d_tag: i64,
+    d_val_ptr: u64,
+}
+
+#[repr(C)]
+struct Elf64_Sym {
+    st_name: u32,
+    st_info: u8,
+    st_other: u8,
+    st_shndx: u16,
+    st_value: u64,
+    st_size: u64,
+}
+
+const PT_DYNAMIC: u32 = 2;
+const DT_NULL: i64 = 0;
+const DT_STRTAB: i64 = 5;
+const DT_SYMTAB: i64 = 6;
+
+unsafe fn find_symbol_in_elf_memory(base: usize, target_name: &str) -> Option<*mut c_void> {
+    if base == 0 {
+        return None;
+    }
+    let ehdr = &*(base as *const Elf64_Ehdr);
+    if &ehdr.e_ident[0..4] != b"\x7fELF" {
+        return None;
+    }
+
+    let phdr_ptr = (base + ehdr.e_phoff as usize) as *const Elf64_Phdr;
+    let mut dyn_ptr: *const Elf64_Dyn = ptr::null();
+    for i in 0..ehdr.e_phnum as usize {
+        let ph = &*phdr_ptr.add(i);
+        if ph.p_type == PT_DYNAMIC {
+            dyn_ptr = (base + ph.p_vaddr as usize) as *const Elf64_Dyn;
+            break;
+        }
+    }
+    if dyn_ptr.is_null() {
+        return None;
+    }
+
+    let mut symtab_addr: usize = 0;
+    let mut strtab_addr: usize = 0;
+    let mut d = dyn_ptr;
+    loop {
+        let tag = (*d).d_tag;
+        if tag == DT_NULL {
+            break;
+        }
+        if tag == DT_SYMTAB {
+            symtab_addr = (*d).d_val_ptr as usize;
+        } else if tag == DT_STRTAB {
+            strtab_addr = (*d).d_val_ptr as usize;
+        }
+        d = d.add(1);
+    }
+
+    if symtab_addr == 0 || strtab_addr == 0 {
+        return None;
+    }
+    if symtab_addr < base {
+        symtab_addr += base;
+    }
+    if strtab_addr < base {
+        strtab_addr += base;
+    }
+
+    let target_bytes = target_name.as_bytes();
+    let symtab = symtab_addr as *const Elf64_Sym;
+    let strtab = strtab_addr as *const u8;
+
+    for i in 1..20000 {
+        let sym = &*symtab.add(i);
+        if sym.st_name != 0 {
+            let mut name_ptr = strtab.add(sym.st_name as usize);
+            let mut matched = true;
+            for &b in target_bytes {
+                if *name_ptr != b {
+                    matched = false;
+                    break;
+                }
+                name_ptr = name_ptr.add(1);
+            }
+            if matched && *name_ptr == 0 {
+                return Some((base + sym.st_value as usize) as *mut c_void);
+            }
+        }
+        if symtab_addr < strtab_addr && (symtab.add(i) as usize) >= strtab_addr {
+            break;
+        }
+    }
+
+    None
+}
+
 type FnGetNativeWindow = unsafe extern "C" fn(holder: *mut c_void) -> *mut c_void;
 type FnDestroySurfaceHolder = unsafe extern "C" fn(holder: *mut c_void);
 
@@ -329,23 +456,44 @@ impl SurfaceBridge {
         let got_page = (conv_base + 0x2000) & !(page_size - 1);
 
         if is_v1 {
-            let ztt_v1 = symbol(
-                ptr::null_mut(),
-                "_ZTTN7android8hardware8graphics11bufferqueue4V1_05utils24H2BGraphicBufferProducerE",
-            );
-            let ztv_v1 = symbol(
-                ptr::null_mut(),
-                "_ZTVN7android8hardware8graphics11bufferqueue4V1_05utils24H2BGraphicBufferProducerE",
-            );
+            let got_ztt_ptr = (conv_base + 0x2240) as *mut usize;
+            let got_ztv_ptr = (conv_base + 0x2248) as *mut usize;
+            unsafe {
+                orig_ztt = *got_ztt_ptr;
+                orig_ztv = *got_ztv_ptr;
+            }
+
+            let mut gui_info = DlInfo {
+                dli_fname: ptr::null(),
+                dli_fbase: ptr::null_mut(),
+                dli_sname: ptr::null(),
+                dli_saddr: ptr::null_mut(),
+            };
+            let dladdr_gui = unsafe { dladdr(orig_ztt as *const c_void, &mut gui_info) };
+            let libgui_base = if dladdr_gui != 0 && !gui_info.dli_fbase.is_null() {
+                gui_info.dli_fbase as usize
+            } else {
+                0
+            };
+            logging::info(&format!(
+                "preview: libgui base from dladdr: {:#x}",
+                libgui_base
+            ));
+
+            let ztt_v1 = unsafe {
+                find_symbol_in_elf_memory(
+                    libgui_base,
+                    "_ZTTN7android8hardware8graphics11bufferqueue4V1_05utils24H2BGraphicBufferProducerE",
+                )
+            };
+            let ztv_v1 = unsafe {
+                find_symbol_in_elf_memory(
+                    libgui_base,
+                    "_ZTVN7android8hardware8graphics11bufferqueue4V1_05utils24H2BGraphicBufferProducerE",
+                )
+            };
 
             if let (Some(ztt), Some(ztv)) = (ztt_v1, ztv_v1) {
-                let got_ztt_ptr = (conv_base + 0x2240) as *mut usize;
-                let got_ztv_ptr = (conv_base + 0x2248) as *mut usize;
-                unsafe {
-                    orig_ztt = *got_ztt_ptr;
-                    orig_ztv = *got_ztv_ptr;
-                }
-
                 logging::info(&format!(
                     "preview: patching GOT (orig_ztt={:#x}, ztt_v1={:#x}, orig_ztv={:#x}, ztv_v1={:#x})",
                     orig_ztt, ztt as usize, orig_ztv, ztv as usize
@@ -369,7 +517,7 @@ impl SurfaceBridge {
                     logging::error("preview: failed to make GOT writable");
                 }
             } else {
-                logging::error("preview: could not resolve V1_0 ZTT/ZTV symbols");
+                logging::error("preview: could not resolve V1_0 ZTT/ZTV symbols from libgui memory");
             }
         }
 
