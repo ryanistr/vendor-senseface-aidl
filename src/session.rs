@@ -26,7 +26,8 @@ use crate::bindings::android::hardware::keymaster::HardwareAuthToken::HardwareAu
 use crate::bindings::android::hardware::common::NativeHandle::NativeHandle;
 use crate::camera::{CameraEngine, CAPTURE_HEIGHT, CAPTURE_WIDTH};
 use crate::logging::{self, get_prop};
-use crate::stface::{self, StFace, CAMERA_CHOOSE_PATH};
+use crate::stface::{self, EnrollOutcome, StFace, CAMERA_CHOOSE_PATH};
+use crate::surface_bridge;
 
 /// The algorithm library is process-global; both sessions and the service entry
 /// point go through this one handle so st_auth_init runs exactly once.
@@ -87,6 +88,30 @@ fn close_camera() {
     }
 }
 
+
+/// Extract the HAL token from the preview `NativeHandle`.
+///
+/// The framework packs the token into the handle's `ints`: the first int is
+/// the token length in bytes and the token bytes follow. The handle carries no
+/// file descriptors, so the token is the only payload.
+fn token_from_handle(handle: &NativeHandle) -> Vec<u8> {
+    if handle.ints.is_empty() {
+        return Vec::new();
+    }
+    let len = handle.ints[0] as usize;
+    let mut bytes = Vec::with_capacity(handle.ints.len() * 4);
+    for word in &handle.ints[1..] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes.truncate(len);
+    logging::info(&format!(
+        "session: preview token {} bytes from {} ints",
+        bytes.len(),
+        handle.ints.len()
+    ));
+    bytes
+}
+
 pub struct CancellationSignal {
     pub is_cancelled: Arc<AtomicBool>,
 }
@@ -98,6 +123,7 @@ impl ICancellationSignal for CancellationSignal {
         self.is_cancelled.store(true, Ordering::SeqCst);
         logging::info("session: operation cancelled");
         close_camera();
+        surface_bridge::clear();
         Ok(())
     }
 }
@@ -148,11 +174,20 @@ impl ISession for FaceSession {
     fn enroll(
         &self,
         _hat: &HardwareAuthToken,
-        _type: EnrollmentType,
-        _features: &[Feature],
+        _type: i8,
+        _features: &[u8],
         _preview_surface: Option<&NativeHandle>,
     ) -> rsbinder::status::Result<Strong<dyn ICancellationSignal>> {
         logging::info("session: enroll");
+        logging::info(&format!(
+            "session: enroll type={} features={} preview={}",
+            _type,
+            _features.len(),
+            match _preview_surface {
+                Some(h) => format!("fd={} ints={:?}", h.fds.len(), h.ints),
+                None => "none".to_string(),
+            }
+        ));
         let algo = match algo() {
             Some(a) => a,
             None => {
@@ -162,6 +197,33 @@ impl ISession for FaceSession {
                 }));
             }
         };
+
+        // The stock HAL prepares the algorithm before scanning: image count per
+        // face id, reset, drop stale faces and install the search ROI.
+        {
+            let guard = algo.lock().unwrap();
+            if let Err(e) = guard.prepare_enroll() {
+                logging::error(&format!("session: enrollment setup failed ret={}", e));
+                self.err(FaceError::UNABLE_TO_PROCESS, 0);
+                return Ok(BnCancellationSignal::new_binder(CancellationSignal {
+                    is_cancelled: Arc::new(AtomicBool::new(true)),
+                }));
+            }
+        }
+
+        // The preview surface arrives as a HAL token in the NativeHandle's ints
+        // (the framework packs it there; see FaceService.acquireSurfaceHandle).
+        // Turn it into a window the camera frames can be drawn into.
+        if let Some(handle) = _preview_surface {
+            let token = token_from_handle(handle);
+            match surface_bridge::SurfaceBridge::create(&token) {
+                Some(bridge) => {
+                    logging::info("session: preview surface attached");
+                    surface_bridge::install(bridge);
+                }
+                None => logging::error("session: could not decode the preview surface token"),
+            }
+        }
 
         let cb = self.callback.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -190,31 +252,43 @@ impl ISession for FaceSession {
             let started = {
                 let mut lock = GLOBAL_CAMERA.lock().unwrap();
                 match lock.as_mut() {
-                    Some(c) => c.start_capture(CAPTURE_WIDTH, CAPTURE_HEIGHT, move |data, _w, _h| {
+                    Some(c) => c.start_capture(CAPTURE_WIDTH, CAPTURE_HEIGHT, move |data, w, h, stride| {
                         if c2.load(Ordering::SeqCst) {
                             return;
                         }
                         if e2.load(Ordering::SeqCst) >= total {
                             return;
                         }
-                        // The Y plane is what the algorithm library consumes.
+                        // The algorithm library consumes NV21: the Y plane
+                        // followed by the interleaved V and U planes.
                         let frame = unsafe {
-                            std::slice::from_raw_parts(data, (CAPTURE_WIDTH * CAPTURE_HEIGHT) as usize)
+                            std::slice::from_raw_parts(data, (w * h * 3 / 2) as usize)
                         };
+                        // Draw the frame into the preview surface.
+                        surface_bridge::render_current(frame, w, h);
                         let guard = a2.lock().unwrap();
-                        match guard.enroll(frame) {
-                            Ok(face_id) => {
+                        // st_auth_enroll returns the number of images it still
+                        // needs; 0 means the enrollment finished and the
+                        // returned value is the new face id.
+                        match guard.enroll(frame, w, h, stride) {
+                            Ok(EnrollOutcome::Accepted) => {
                                 let n = e2.fetch_add(1, Ordering::SeqCst) + 1;
                                 let remaining = (total - n).max(0);
                                 logging::info(&format!(
-                                    "session: enrolled frame {}/{} face_id={}",
-                                    n, total, face_id
+                                    "session: enroll sample {}/{} accepted",
+                                    n, total
                                 ));
-                                let _ = cb2.onEnrollmentProgress(face_id, remaining);
-                                if remaining == 0 {
-                                    let _ = cb2.onEnrollmentProgress(face_id, 0);
-                                    close_camera();
-                                }
+                                let _ = cb2.onEnrollmentProgress(0, remaining);
+                            }
+                            Ok(EnrollOutcome::Complete(face_id)) => {
+                                let n = e2.fetch_add(1, Ordering::SeqCst) + 1;
+                                logging::info(&format!(
+                                    "session: enrollment complete after {} samples, face_id={}",
+                                    n, face_id
+                                ));
+                                let _ = cb2.onEnrollmentProgress(face_id, 0);
+                                close_camera();
+                                surface_bridge::clear();
                             }
                             Err(r) => {
                                 logging::error(&format!("session: st_auth_enroll ret={}", r));
@@ -246,6 +320,19 @@ impl ISession for FaceSession {
             }
         };
 
+        // The stock HAL prepares the algorithm before scanning: image count per
+        // face id, reset, drop stale faces and install the search ROI.
+        {
+            let guard = algo.lock().unwrap();
+            if let Err(e) = guard.prepare_enroll() {
+                logging::error(&format!("session: enrollment setup failed ret={}", e));
+                self.err(FaceError::UNABLE_TO_PROCESS, 0);
+                return Ok(BnCancellationSignal::new_binder(CancellationSignal {
+                    is_cancelled: Arc::new(AtomicBool::new(true)),
+                }));
+            }
+        }
+
         let cb = self.callback.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancel_flag = cancelled.clone();
@@ -272,20 +359,20 @@ impl ISession for FaceSession {
             let started = {
                 let mut lock = GLOBAL_CAMERA.lock().unwrap();
                 match lock.as_mut() {
-                    Some(c) => c.start_capture(CAPTURE_WIDTH, CAPTURE_HEIGHT, move |data, _w, _h| {
+                    Some(c) => c.start_capture(CAPTURE_WIDTH, CAPTURE_HEIGHT, move |data, w, h, stride| {
                         if c2.load(Ordering::SeqCst) || d2.load(Ordering::SeqCst) {
                             return;
                         }
                         let frame = unsafe {
-                            std::slice::from_raw_parts(data, (CAPTURE_WIDTH * CAPTURE_HEIGHT) as usize)
+                            std::slice::from_raw_parts(data, (w * h * 3 / 2) as usize)
                         };
                         let guard = a2.lock().unwrap();
-                        match guard.unlock(frame) {
+                        match guard.unlock(frame, w, h, stride) {
                             Ok(()) => {
                                 d2.store(true, Ordering::SeqCst);
                                 logging::info("session: authentication succeeded");
-                                // CONVENIENCE strength: an empty token (challenge 0,
-                                // no mac) is what the framework expects here.
+                                // Weak strength: an empty token (challenge 0, no mac)
+                                // is what the framework expects here.
                                 let hat = HardwareAuthToken::default();
                                 let _ = cb2.onAuthenticationSucceeded(0, &hat);
                                 close_camera();
@@ -374,7 +461,7 @@ impl ISession for FaceSession {
     }
 
     fn getAuthenticatorId(&self) -> rsbinder::status::Result<()> {
-        // CONVENIENCE strength sensors must report 0.
+        // Weak sensors must report 0.
         self.callback.onAuthenticatorIdRetrieved(0)?;
         Ok(())
     }
@@ -392,6 +479,7 @@ impl ISession for FaceSession {
     fn close(&self) -> rsbinder::status::Result<()> {
         logging::info("session: close");
         close_camera();
+        surface_bridge::clear();
         self.callback.onSessionClosed()?;
         Ok(())
     }
@@ -407,8 +495,8 @@ impl ISession for FaceSession {
     fn enrollWithContext(
         &self,
         hat: &HardwareAuthToken,
-        r#type: EnrollmentType,
-        features: &[Feature],
+        r#type: i8,
+        features: &[u8],
         preview_surface: Option<&NativeHandle>,
         _context: &OperationContext,
     ) -> rsbinder::status::Result<Strong<dyn ICancellationSignal>> {

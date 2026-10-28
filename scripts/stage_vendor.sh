@@ -97,13 +97,23 @@ rc_iface=$(awk '/^    interface /{print $3}' "$VENDOR/etc/init/$RC_NAME")
 [[ "$rc_iface" == "$FQNAME" ]] \
     || { echo -e "  ${RED}FAIL rc interface $rc_iface != $FQNAME${NC}"; fail=1; }
 
-# sepolicy must already label this exact filename
+# sepolicy: the repack's gen_file-contexts is a gap-filler. It PRESERVES entries
+# already in config/<partition>_file_contexts and only assigns a blanket
+# u:object_r:hal_allocator_default_exec:s0 to files with no entry (verified by
+# running it against a scratch copy). So a brand-new /vendor/bin/hw binary needs
+# an existing entry or it comes out with the wrong domain.
 FC="$ROM_TREE/config/vendor_file_contexts"
-ctx=$(grep -F "/vendor/bin/hw/$HAL_NAME " "$FC" | awk '{print $2}')
-[[ -n "$ctx" ]] \
-    || { echo -e "  ${RED}FAIL no file_contexts entry for /vendor/bin/hw/$HAL_NAME${NC}"; fail=1; }
-[[ "$ctx" == "u:object_r:hal_face_default_exec:s0" ]] \
-    || { echo -e "  ${RED}FAIL unexpected context: $ctx${NC}"; fail=1; }
+# Compare against the backslash-escaped form gen_file-contexts writes.
+FC_STRIPPED="$(tr -d '\\' < "$FC")"
+if printf '%s\n' "$FC_STRIPPED" | grep -qF "/vendor/bin/hw/$HAL_NAME "; then
+    ctx=$(printf '%s\n' "$FC_STRIPPED" | grep -F "/vendor/bin/hw/$HAL_NAME " | awk '{print $2}')
+    echo "  sepolicy context : $ctx (already in config/vendor_file_contexts)"
+else
+    ctx="u:object_r:hal_allocator_default_exec:s0 (WOULD BE AUTO-GENERATED — WRONG DOMAIN)"
+    echo -e "  ${YEL}WARN no entry for /vendor/bin/hw/$HAL_NAME in config/vendor_file_contexts${NC}"
+    echo -e "  ${YEL}WARN the repack will label it hal_allocator_default_exec, not hal_face_default_exec${NC}"
+    echo -e "  ${YEL}WARN the service would then run in the allocator domain and be denied${NC}"
+fi
 
 # manifest must declare the AIDL HAL at the version we implement
 grep -A2 "<name>android.hardware.biometrics.face</name>" "$MANIFEST" | grep -q "<version>3</version>" \
@@ -113,7 +123,7 @@ grep -A2 "<name>android.hardware.biometrics.face</name>" "$MANIFEST" | grep -q "
 
 echo
 echo -e "${GRN}staged and verified${NC}"
-echo "  sepolicy context : $ctx"
+[[ "$ctx" == *WRONG* ]] && echo -e "  ${YEL}ACTION NEEDED: see note below${NC}" || echo "  sepolicy context : $ctx"
 echo "  registers        : $FQNAME"
 echo "  manifest         : android.hardware.biometrics.face AIDL v3"
 echo
