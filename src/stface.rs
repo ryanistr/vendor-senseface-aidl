@@ -600,10 +600,21 @@ impl StFace {
         }
         let stored = self.last_face_id.load(std::sync::atomic::Ordering::SeqCst);
         if stored > 0 {
-            stored
-        } else {
-            11
+            return stored;
         }
+        // Direct read from SenseTime template protobuf file if stored ID was reset after reboot
+        if let Ok(bytes) = std::fs::read("/data/vendor_de/0/facedata/template_file.data") {
+            for i in 0..bytes.len().min(32) {
+                if bytes[i] == 0x10 && i + 1 < bytes.len() {
+                    let id = bytes[i + 1] as i32;
+                    if id > 0 {
+                        self.last_face_id.store(id, std::sync::atomic::Ordering::SeqCst);
+                        return id;
+                    }
+                }
+            }
+        }
+        11
     }
 
     pub fn has_enrolled_face(&self) -> bool {
