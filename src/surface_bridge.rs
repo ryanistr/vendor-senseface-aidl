@@ -287,21 +287,25 @@ impl SurfaceBridge {
 
         let mut producer: *mut c_void = ptr::null_mut();
         let mut is_v1 = false;
-        for (lib, sym) in [
+        for (libs, sym, v1) in [
             (
-                "/apex/com.android.vndk.v31/lib64/android.hardware.graphics.bufferqueue@2.0.so",
+                &[
+                    "/system/lib64/android.hardware.graphics.bufferqueue@2.0.so",
+                    "android.hardware.graphics.bufferqueue@2.0.so",
+                ][..],
                 "_ZN7android8hardware8graphics11bufferqueue4V2_022IGraphicBufferProducer8castFromERKNS_2spINS_4hidl4base4V1_05IBaseEEEb",
+                false,
             ),
             (
-                "/apex/com.android.vndk.v31/lib64/android.hardware.graphics.bufferqueue@1.0.so",
+                &[
+                    "/system/lib64/android.hardware.graphics.bufferqueue@1.0.so",
+                    "android.hardware.graphics.bufferqueue@1.0.so",
+                ][..],
                 "_ZN7android8hardware8graphics11bufferqueue4V1_022IGraphicBufferProducer8castFromERKNS_2spINS_4hidl4base4V1_05IBaseEEEb",
+                true,
             ),
         ] {
-            let handle = match load_lib(&[
-                lib,
-                "android.hardware.graphics.bufferqueue@1.0.so",
-                "android.hardware.graphics.bufferqueue@2.0.so",
-            ]) {
+            let handle = match load_lib(libs) {
                 Some(h) => h,
                 None => continue,
             };
@@ -313,7 +317,7 @@ impl SurfaceBridge {
             logging::info(&format!("preview: castFrom -> {:#x}", p as usize));
             if !p.is_null() {
                 producer = p;
-                is_v1 = sym.contains("V1_0");
+                is_v1 = v1;
                 break;
             }
         }
@@ -458,53 +462,47 @@ impl SurfaceBridge {
 
         let y_plane = nv21;
         let vu_plane = &nv21[(width * height) as usize..];
-        let (cols, rows): (Vec<i32>, Vec<i32>) = if bh > 1 && bw > 1 {
-            (
-                (0..bw)
-                    .map(|dx| ((height - 1) * dx) / (bw - 1))
-                    .collect(),
-                (0..bh)
-                    .map(|dy| ((width - 1) * (bh - 1 - dy)) / (bh - 1))
-                    .collect(),
-            )
-        } else {
-            (vec![0; bw as usize], vec![0; bh as usize])
-        };
+        let max_w = width - 1;
+        let max_h = height - 1;
+        let denom_w = (bw - 1).max(1);
+        let denom_h = (bh - 1).max(1);
 
         if buffer.format == 4 {
             // WINDOW_FORMAT_RGB_565
             let dst = buffer.bits as *mut u16;
             for dy in 0..bh {
-                let sensor_col = rows[dy as usize] as usize;
+                let sensor_col = ((max_w * (bh - 1 - dy)) / denom_h) as usize;
                 let col_uv_base = (sensor_col >> 1) << 1;
+                let dst_row = unsafe { dst.add(dy as usize * stride as usize) };
                 for dx in 0..bw {
-                    let sensor_row = cols[dx as usize] as usize;
+                    let sensor_row = ((max_h * dx) / denom_w) as usize;
                     let y_val = y_plane[sensor_col + sensor_row * width as usize];
                     let uv_idx = (sensor_row >> 1) * width as usize + col_uv_base;
                     let v_val = vu_plane[uv_idx];
                     let u_val = vu_plane[uv_idx + 1];
                     let (r, g, b) = yuv_to_rgb(y_val, u_val, v_val);
                     unsafe {
-                        *dst.add(dy as usize * stride as usize + dx as usize) =
+                        *dst_row.add(dx as usize) =
                             (((r >> 3) as u16) << 11) | (((g >> 2) as u16) << 5) | ((b >> 3) as u16);
                     }
                 }
             }
         } else {
-            // WINDOW_FORMAT_RGBA_8888
+            // WINDOW_FORMAT_RGBA_8888 or RGBX_8888
             let dst = buffer.bits as *mut u32;
             for dy in 0..bh {
-                let sensor_col = rows[dy as usize] as usize;
+                let sensor_col = ((max_w * (bh - 1 - dy)) / denom_h) as usize;
                 let col_uv_base = (sensor_col >> 1) << 1;
+                let dst_row = unsafe { dst.add(dy as usize * stride as usize) };
                 for dx in 0..bw {
-                    let sensor_row = cols[dx as usize] as usize;
+                    let sensor_row = ((max_h * dx) / denom_w) as usize;
                     let y_val = y_plane[sensor_col + sensor_row * width as usize];
                     let uv_idx = (sensor_row >> 1) * width as usize + col_uv_base;
                     let v_val = vu_plane[uv_idx];
                     let u_val = vu_plane[uv_idx + 1];
                     let (r, g, b) = yuv_to_rgb(y_val, u_val, v_val);
                     unsafe {
-                        *dst.add(dy as usize * stride as usize + dx as usize) =
+                        *dst_row.add(dx as usize) =
                             0xFF00_0000 | ((b as u32) << 16) | ((g as u32) << 8) | r as u32;
                     }
                 }

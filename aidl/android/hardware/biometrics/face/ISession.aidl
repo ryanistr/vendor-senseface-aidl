@@ -154,8 +154,8 @@ interface ISession {
      * @return ICancellationSignal An object that can be used by the framework to cancel this
      * operation.
      */
-    ICancellationSignal enroll(in HardwareAuthToken hat, in EnrollmentType type,
-            in Feature[] features, in @nullable NativeHandle previewSurface);
+    ICancellationSignal enroll(in HardwareAuthToken hat, in byte type,
+            in byte[] features, in @nullable NativeHandle previewSurface);
 
     /**
      * authenticate:
@@ -457,8 +457,8 @@ interface ISession {
     ICancellationSignal authenticateWithContext(in long operationId, in OperationContext context);
 
     /* See ISession#enroll(HardwareAuthToken, EnrollmentType, Feature[], NativeHandle) */
-    ICancellationSignal enrollWithContext(in HardwareAuthToken hat, in EnrollmentType type,
-            in Feature[] features, in @nullable NativeHandle previewSurface,
+    ICancellationSignal enrollWithContext(in HardwareAuthToken hat, in byte type,
+            in byte[] features, in @nullable NativeHandle previewSurface,
             in OperationContext context);
 
     /* See ISession#detectInteraction() */

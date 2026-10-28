@@ -10,10 +10,20 @@ edition = "2021"
 name = "face-hal-service"
 path = "src/main.rs"
 
+# Device-side self test for the algorithm binding. Not shipped: scripts/
+# stage_vendor.sh only installs face-hal-service.
+[[bin]]
+name = "face-selftest"
+path = "src/selftest.rs"
+
 [dependencies]
 rsbinder = { version = "0.6.0", features = ["android_14"] }
 async-trait = "0.1"
 libc = "0.2"
+# rsbinder reports parcel/dispatch failures through the `log` facade. Without a
+# logger installed those messages go nowhere, which makes an unmarshal failure
+# indistinguishable from a HAL that never received the transaction.
+log = "0.4"
 
 [build-dependencies]
 rsbinder-aidl = "=0.6.0"

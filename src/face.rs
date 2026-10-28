@@ -2,9 +2,10 @@
 //
 // IFace — the top-level face HAL interface the framework binds to.
 //
-// Sensor strength is CONVENIENCE, not STRONG: this is an RGB camera sensor with
-// no TEE-backed template storage, so it must not hand the framework a
-// HardwareAuthToken. That is also why getAuthenticatorId returns 0.
+// Sensor strength is WEAK, matching the stock Infinix vendor config for this face
+// sensor ("0:2:15" -> strength 15 -> WEAK). Not STRONG: an RGB camera with no
+// TEE-backed template storage, so it must not hand out a HardwareAuthToken —
+// hence getAuthenticatorId returns 0.
 #![allow(non_snake_case, dead_code)]
 
 use rsbinder::{status::Result as BinderResult, Interface, Strong};
@@ -40,7 +41,7 @@ impl IFace for FaceHal {
         let props = SensorProps {
             commonProps: CommonProps {
                 sensorId: SENSOR_ID,
-                sensorStrength: SensorStrength::CONVENIENCE,
+                sensorStrength: SensorStrength::WEAK,
                 maxEnrollmentsPerUser: 3,
                 componentInfo: vec![ComponentInfo {
                     componentId: "faceSensor".to_string(),

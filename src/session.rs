@@ -248,6 +248,8 @@ impl ISession for FaceSession {
             let c2 = cancel_flag.clone();
             let a2 = algo.clone();
             let cb2 = cb.clone();
+            let last_sample_time = Arc::new(Mutex::new(std::time::Instant::now()));
+            let lst = last_sample_time.clone();
 
             let started = {
                 let mut lock = GLOBAL_CAMERA.lock().unwrap();
@@ -264,8 +266,18 @@ impl ISession for FaceSession {
                         let frame = unsafe {
                             std::slice::from_raw_parts(data, (w * h * 3 / 2) as usize)
                         };
-                        // Draw the frame into the preview surface.
+                        // Draw the frame into the preview surface on every single camera frame.
                         surface_bridge::render_current(frame, w, h);
+
+                        // Pace enrollment samples so the UI circle and camera preview have time to show.
+                        {
+                            let mut t_lock = lst.lock().unwrap();
+                            if t_lock.elapsed().as_millis() < 250 {
+                                return;
+                            }
+                            *t_lock = std::time::Instant::now();
+                        }
+
                         let guard = a2.lock().unwrap();
                         // st_auth_enroll returns the number of images it still
                         // needs; 0 means the enrollment finished and the
@@ -320,19 +332,6 @@ impl ISession for FaceSession {
             }
         };
 
-        // The stock HAL prepares the algorithm before scanning: image count per
-        // face id, reset, drop stale faces and install the search ROI.
-        {
-            let guard = algo.lock().unwrap();
-            if let Err(e) = guard.prepare_enroll() {
-                logging::error(&format!("session: enrollment setup failed ret={}", e));
-                self.err(FaceError::UNABLE_TO_PROCESS, 0);
-                return Ok(BnCancellationSignal::new_binder(CancellationSignal {
-                    is_cancelled: Arc::new(AtomicBool::new(true)),
-                }));
-            }
-        }
-
         let cb = self.callback.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancel_flag = cancelled.clone();
@@ -355,6 +354,7 @@ impl ISession for FaceSession {
             let c2 = cancel_flag.clone();
             let a2 = algo.clone();
             let cb2 = cb.clone();
+            let start_time = std::time::Instant::now();
 
             let started = {
                 let mut lock = GLOBAL_CAMERA.lock().unwrap();
@@ -363,6 +363,14 @@ impl ISession for FaceSession {
                         if c2.load(Ordering::SeqCst) || d2.load(Ordering::SeqCst) {
                             return;
                         }
+                        if start_time.elapsed().as_secs() > 8 {
+                            d2.store(true, Ordering::SeqCst);
+                            logging::info("session: authenticate timed out after 8s");
+                            let _ = cb2.onError(FaceError::TIMEOUT, 0);
+                            close_camera();
+                            return;
+                        }
+
                         let frame = unsafe {
                             std::slice::from_raw_parts(data, (w * h * 3 / 2) as usize)
                         };
@@ -370,17 +378,18 @@ impl ISession for FaceSession {
                         match guard.unlock(frame, w, h, stride) {
                             Ok(()) => {
                                 d2.store(true, Ordering::SeqCst);
-                                logging::info("session: authentication succeeded");
+                                let face_id = guard.get_face_id();
+                                logging::info(&format!("session: authentication succeeded for face_id={}", face_id));
                                 // Weak strength: an empty token (challenge 0, no mac)
                                 // is what the framework expects here.
                                 let hat = HardwareAuthToken::default();
-                                let _ = cb2.onAuthenticationSucceeded(0, &hat);
+                                let _ = cb2.onAuthenticationSucceeded(face_id, &hat);
                                 close_camera();
                             }
                             Err(r) => {
                                 // Non-zero is "no match yet", not a fatal error;
-                                // keep scanning until the framework cancels.
-                                if r != stface::ST_OK {
+                                // keep scanning until the framework cancels or times out.
+                                if r != stface::ST_OK && r != 1 {
                                     logging::info(&format!("session: st_auth_unlock ret={}", r));
                                 }
                             }
@@ -411,15 +420,10 @@ impl ISession for FaceSession {
         let ids = match algo() {
             Some(a) => {
                 let g = a.lock().unwrap();
-                match g.template_info() {
-                    Ok(buf) => {
-                        // st_template_info_t is 24 bytes; its first word is the
-                        // enrolled face count on this library. Treat it as a
-                        // count, not a struct, until the layout is confirmed.
-                        let count = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                        (0..count.max(0)).collect::<Vec<i32>>()
-                    }
-                    Err(_) => vec![],
+                if g.has_enrolled_face() {
+                    vec![g.get_face_id()]
+                } else {
+                    vec![]
                 }
             }
             None => vec![],

@@ -14,6 +14,7 @@ mod face;
 mod logging;
 mod session;
 mod stface;
+mod surface_bridge;
 
 use rsbinder::{hub, ProcessState};
 
@@ -24,6 +25,7 @@ const SERVICE_NAME: &str = "android.hardware.biometrics.face.IFace/default";
 
 fn main() {
     logging::init();
+    logging::init_rsbinder_logger();
     logging::info("Face HAL (AIDL, rsbinder) starting");
 
     // Default driver + a thread pool sized for the camera callback path.

@@ -47,6 +47,48 @@ fn main() {
         let repl = format!("#[async_trait::async_trait]\npub trait {}: rsbinder::Interface", t);
         content = content.replace(&target, &repl);
     }
+
+    // The framework's IFace$Stub answers getInterfaceHash/getInterfaceVersion at
+    // AIDL's reserved codes 0xfffffe / 0xffffff, not as sequential methods — the
+    // frozen V3 .aidl snapshot omits them, so rsbinder-aidl never generates them.
+    // Without these arms both calls answer UNKNOWN_TRANSACTION, and
+    // FaceStartUserClient treats that as a remote exception and finishes the
+    // client without authenticating. Inject them into every generated dispatch.
+    let mut patched = String::with_capacity(content.len() + 768);
+    let needle = "_ => Err(rsbinder::StatusCode::UnknownTransaction),";
+    let mut injected = 0usize;
+    for line in content.lines() {
+        if line.trim() == needle {
+            let ind = &line[..line.len() - line.trim_start().len()];
+            patched.push_str(&format!(
+                "{i}{h} => {{\n\
+                 {i}    _reply.write(&rsbinder::Status::from(rsbinder::StatusCode::Ok))?;\n\
+                 {i}    _reply.write(&crate::bindings::INTERFACE_HASH.to_string())?;\n\
+                 {i}    Ok(())\n\
+                 {i}}}\n\
+                 {i}{v} => {{\n\
+                 {i}    _reply.write(&rsbinder::Status::from(rsbinder::StatusCode::Ok))?;\n\
+                 {i}    _reply.write(&crate::bindings::INTERFACE_VERSION)?;\n\
+                 {i}    Ok(())\n\
+                 {i}}}\n\
+                 {i}{needle}\n",
+                i = ind,
+                h = "crate::bindings::GET_INTERFACE_HASH_TRANSACTION",
+                v = "crate::bindings::GET_INTERFACE_VERSION_TRANSACTION",
+                needle = needle,
+            ));
+            injected += 1;
+        } else {
+            patched.push_str(line);
+            patched.push('\n');
+        }
+    }
+    assert!(
+        injected > 0,
+        "no on_transact fallback arm found in generated bindings"
+    );
+    content = patched;
+
     std::fs::write(&out_file, content).unwrap();
 
     // ---- link search paths (ROM-provided libraries only) ----

@@ -51,12 +51,23 @@ pub struct AImageReader_ImageListener {
 const ACAMERA_OK: c_int = 0;
 const AMEDIA_OK: c_int = 0;
 const AIMAGE_FORMAT_YUV_420_888: i32 = 35;
+/// AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN — the stock HAL's reader usage flag.
+const AIMAGE_USAGE_CPU_READ_OFTEN: i64 = 0x1;
 const TEMPLATE_PREVIEW: c_int = 1;
 
-/// Default capture geometry. The stock HAL lets the camera service pick, but a
-/// fixed size keeps the enrollment/auth frame pipeline deterministic.
-pub const CAPTURE_WIDTH: i32 = 480;
-pub const CAPTURE_HEIGHT: i32 = 640;
+/// Capture geometry. The stock HAL opens its AImageReader at exactly 640x480
+/// (`AImageReader_newWithUsage(640, 480, YUV_420_888, 3, 1)`) and rejects any
+/// frame that is not that size, so the port uses the same geometry.
+pub const CAPTURE_WIDTH: i32 = 640;
+pub const CAPTURE_HEIGHT: i32 = 480;
+
+/// Pixel format code for NV21 in the algorithm library's own format enum.
+/// The library maps its format names to integers in the order
+/// yuv420p=1, nv12=2, nv21=3, bgra=4, rgb=5, rgba=6 (the name table is at
+/// 0x595840 in libstfaceunlockppl.so, and the lookup at 0x1d4568 returns those
+/// values). The stock HAL writes the literal `3` into the descriptor's `+0x08`
+/// field, i.e. NV21.
+pub const FORMAT_NV21: i32 = 3;
 
 extern "C" {
     fn ACameraManager_create() -> *mut ACameraManager;
@@ -95,13 +106,17 @@ extern "C" {
         container: *mut ACaptureSessionOutputContainer,
         output: *mut ACaptureSessionOutput,
     ) -> c_int;
+    /// The vendor's camera2ndk takes the output's raw `native_handle*`, not an
+    /// `ANativeWindow*`: it converts it to a `hidl_handle` itself, and the
+    /// library imports no `ANativeWindow` symbol at all. The stock HAL passes
+    /// the reader's handle from `AImageReader_getWindowNativeHandle`.
     fn ACaptureSessionOutput_create(
-        window: *mut ANativeWindow,
+        handle: *mut c_void,
         output: *mut *mut ACaptureSessionOutput,
     ) -> c_int;
     fn ACaptureSessionOutput_free(output: *mut ACaptureSessionOutput);
     fn ACameraOutputTarget_create(
-        window: *mut ANativeWindow,
+        handle: *mut c_void,
         target: *mut *mut ACameraOutputTarget,
     ) -> c_int;
     fn ACameraOutputTarget_free(target: *mut ACameraOutputTarget);
@@ -117,8 +132,22 @@ extern "C" {
         maxImages: i32,
         reader: *mut *mut AImageReader,
     ) -> c_int;
+    fn AImageReader_newWithUsage(
+        width: i32,
+        height: i32,
+        format: i32,
+        maxImages: i32,
+        usage: i64,
+        reader: *mut *mut AImageReader,
+    ) -> c_int;
     fn AImageReader_delete(reader: *mut AImageReader);
     fn AImageReader_getWindow(reader: *mut AImageReader, window: *mut *mut ANativeWindow) -> c_int;
+    /// Deprecated, but the vendor camera2ndk still speaks it: it takes the
+    /// reader's raw `native_handle*`, not an `ANativeWindow*`.
+    fn AImageReader_getWindowNativeHandle(
+        reader: *mut AImageReader,
+        handle: *mut *mut c_void,
+    ) -> c_int;
     fn AImageReader_setImageListener(
         reader: *mut AImageReader,
         listener: *mut AImageReader_ImageListener,
@@ -133,11 +162,87 @@ extern "C" {
         data: *mut *mut u8,
         dataLen: *mut c_int,
     ) -> c_int;
+    fn AImage_getPlanePixelStride(
+        image: *mut AImage,
+        plane: c_int,
+        pixel_stride: *mut c_int,
+    ) -> c_int;
+    fn AImage_getPlaneRowStride(
+        image: *mut AImage,
+        planeIdx: c_int,
+        rowStride: *mut c_int,
+    ) -> c_int;
     fn ANativeWindow_acquire(window: *mut ANativeWindow);
     fn ANativeWindow_release(window: *mut ANativeWindow);
 }
 
-pub type FrameFn = Box<dyn FnMut(*const u8, i32, i32) + Send>;
+/// A captured frame: the Y-plane pointer, its geometry, and the plane's row
+/// stride in bytes. The stride is passed separately because the algorithm
+/// descriptor needs the real stride, which is not the width for a padded
+/// camera buffer.
+
+/// Convert a YUV_420_888 image into the NV21 buffer the algorithm expects.
+///
+/// The Y plane is copied row by row (dropping any row padding) and the V and U
+/// planes are then interleaved as VU pairs, which is the NV21 layout the stock
+/// HAL produces at 0x86a0-0x86bc.
+#[allow(clippy::too_many_arguments)]
+/// Packs the camera's YUV_420_888 planes into the NV21 buffer the SenseTime
+/// library expects: Y plane, then interleaved V,U.
+///
+/// The stock HAL (face.default.so, camera_first_frame_callback at
+/// 0x8634-0x86bc) walks the chroma planes as a flat array indexed by the
+/// plane's *pixel* stride, not per row by the row stride, because the camera
+/// exposes a semi-planar buffer through the planar planes.
+/// Writes the first captured frame to /data/local/tmp/frame.nv21 so the
+/// pixels the algorithm actually sees can be inspected off-device.
+fn dump_frame(nv21: &[u8]) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if std::fs::write("/data/local/tmp/frame.nv21", nv21).is_ok() {
+        logging::info(&format!("camera: dumped {} byte frame", nv21.len()));
+    }
+}
+
+fn to_nv21(
+    y: *const u8,
+    _y_stride: i32,
+    y_len: usize,
+    u: *const u8,
+    u_pixel_stride: i32,
+    _u_len: usize,
+    v: *const u8,
+    width: i32,
+    height: i32,
+) -> Option<Vec<u8>> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let ps = u_pixel_stride.max(1) as usize;
+    let samples = (w * h) / 4;
+    let total_len = (w * h * 3) / 2;
+    let mut out = vec![0u8; total_len];
+
+    unsafe {
+        let copy_y = y_len.min(w * h);
+        std::ptr::copy_nonoverlapping(y, out.as_mut_ptr(), copy_y);
+        let chroma = out.as_mut_ptr().add(w * h);
+        for i in 0..samples {
+            let src_off = i * ps;
+            let dst_off = i * 2;
+            *chroma.add(dst_off) = *v.add(src_off);
+            *chroma.add(dst_off + 1) = *u.add(src_off);
+        }
+    }
+    Some(out)
+}
+
+pub type FrameFn = Box<dyn FnMut(*const u8, i32, i32, i32) + Send>;
 
 pub struct CameraEngine {
     manager: *mut ACameraManager,
@@ -149,6 +254,8 @@ pub struct CameraEngine {
     img_output: *mut ACaptureSessionOutput,
     target: *mut ACameraOutputTarget,
     window: *mut ANativeWindow,
+    /// The reader's raw output handle, which the vendor camera2ndk expects.
+    window_handle: *mut c_void,
 
     device_callbacks: Box<ACameraDevice_StateCallbacks>,
     session_callbacks: Box<ACameraCaptureSession_stateCallbacks>,
@@ -173,6 +280,7 @@ impl CameraEngine {
             img_output: ptr::null_mut(),
             target: ptr::null_mut(),
             window: ptr::null_mut(),
+            window_handle: ptr::null_mut(),
             device_callbacks: Box::new(ACameraDevice_StateCallbacks {
                 context: ptr::null_mut(),
                 onDisconnected: Some(Self::on_disconnected),
@@ -215,26 +323,42 @@ impl CameraEngine {
 
     pub fn start_capture<F>(&mut self, width: i32, height: i32, callback: F) -> bool
     where
-        F: FnMut(*const u8, i32, i32) + Send + 'static,
+        F: FnMut(*const u8, i32, i32, i32) + Send + 'static,
     {
         logging::info(&format!("camera: start_capture {}x{}", width, height));
         unsafe {
             self.teardown_session();
 
             if self.reader.is_null() {
-                let res = AImageReader_new(width, height, AIMAGE_FORMAT_YUV_420_888, 5, &mut self.reader);
+                // The stock HAL opens the reader with
+                // AImageReader_newWithUsage(640, 480, YUV_420_888, 3, 1) —
+                // usage 1 is CPU_READ_OFTEN, without which the buffers cannot
+                // be read back on the CPU, and maxImages is 3.
+                let res = AImageReader_newWithUsage(
+                    width,
+                    height,
+                    AIMAGE_FORMAT_YUV_420_888,
+                    3,
+                    AIMAGE_USAGE_CPU_READ_OFTEN,
+                    &mut self.reader,
+                );
                 if res != AMEDIA_OK || self.reader.is_null() {
-                    logging::error(&format!("camera: AImageReader_new ret={}", res));
+                    logging::error(&format!("camera: AImageReader_newWithUsage ret={}", res));
                     return false;
                 }
-                let mut native_window = ptr::null_mut();
-                let win_status = AImageReader_getWindow(self.reader, &mut native_window);
-                if win_status != AMEDIA_OK || native_window.is_null() {
-                    logging::error(&format!("camera: AImageReader_getWindow ret={}", win_status));
+                // The output's raw native handle is what the vendor camera2ndk
+                // wants (it has no ANativeWindow support of its own).
+                let mut handle: *mut c_void = ptr::null_mut();
+                let handle_status =
+                    AImageReader_getWindowNativeHandle(self.reader, &mut handle);
+                if handle_status != AMEDIA_OK || handle.is_null() {
+                    logging::error(&format!(
+                        "camera: AImageReader_getWindowNativeHandle ret={}",
+                        handle_status
+                    ));
                     return false;
                 }
-                ANativeWindow_acquire(native_window);
-                self.window = native_window;
+                self.window_handle = handle;
             }
 
             if !self.image_callback_ctx.is_null() {
@@ -255,7 +379,7 @@ impl CameraEngine {
                 logging::error(&format!("camera: output container create ret={}", res));
                 return false;
             }
-            let res = ACaptureSessionOutput_create(self.window, &mut self.img_output);
+            let res = ACaptureSessionOutput_create(self.window_handle, &mut self.img_output);
             if res != ACAMERA_OK {
                 logging::error(&format!("camera: session output create ret={}", res));
                 return false;
@@ -267,7 +391,7 @@ impl CameraEngine {
             }
             self.output_added = true;
 
-            let res = ACameraOutputTarget_create(self.window, &mut self.target);
+            let res = ACameraOutputTarget_create(self.window_handle, &mut self.target);
             if res != ACAMERA_OK {
                 logging::error(&format!("camera: output target create ret={}", res));
                 return false;
@@ -366,15 +490,71 @@ impl CameraEngine {
             AImage_getWidth(image, &mut width);
             AImage_getHeight(image, &mut height);
 
+            // The algorithm library consumes NV21, not the Y plane. The stock
+            // HAL copies the Y plane and then interleaves the V and U planes
+            // into one buffer (face.default.so, camera_first_frame_callback at
+            // 0x8634-0x86bc), so this does the same.
             let mut y_data = ptr::null_mut();
             let mut y_len = 0;
             AImage_getPlaneData(image, 0, &mut y_data, &mut y_len);
+            let mut u_data = ptr::null_mut();
+            let mut u_len = 0;
+            AImage_getPlaneData(image, 1, &mut u_data, &mut u_len);
+            let mut v_data = ptr::null_mut();
+            let mut v_len = 0;
+            AImage_getPlaneData(image, 2, &mut v_data, &mut v_len);
 
-            if !context.is_null() && !y_data.is_null() {
-                let m = &*(context as *const Mutex<Option<FrameFn>>);
-                if let Ok(mut lock) = m.try_lock() {
-                    if let Some(cb) = lock.as_mut() {
-                        cb(y_data, width, height);
+            let mut y_stride = 0;
+            AImage_getPlaneRowStride(image, 0, &mut y_stride);
+            let mut u_stride = 0;
+            AImage_getPlaneRowStride(image, 1, &mut u_stride);
+            let mut v_stride = 0;
+            AImage_getPlaneRowStride(image, 2, &mut v_stride);
+            let mut y_pixel = 0;
+            AImage_getPlanePixelStride(image, 0, &mut y_pixel);
+            let mut u_pixel = 0;
+            AImage_getPlanePixelStride(image, 1, &mut u_pixel);
+            let mut v_pixel = 0;
+            AImage_getPlanePixelStride(image, 2, &mut v_pixel);
+
+            logging::info(&format!(
+                "camera: frame {}x{} y_stride={} y_pixel={} u_stride={} u_pixel={} v_stride={} v_pixel={} lens={} lens_len={} ulen={} vlen={} u={:p} v={:p}",
+                width,
+                height,
+                y_stride,
+                y_pixel,
+                u_stride,
+                u_pixel,
+                v_stride,
+                v_pixel,
+                y_len,
+                y_len,
+                u_len,
+                v_len,
+                u_data,
+                v_data
+            ));
+            if !context.is_null() && !y_data.is_null() && !u_data.is_null() && !v_data.is_null() {
+                let nv21 = to_nv21(
+                    y_data,
+                    y_stride,
+                    y_len as usize,
+                    u_data,
+                    u_pixel,
+                    u_len as usize,
+                    v_data,
+                    width,
+                    height,
+                );
+                if let Some(nv21) = nv21 {
+                    dump_frame(&nv21);
+                    let m = &*(context as *const Mutex<Option<FrameFn>>);
+                    if let Ok(mut lock) = m.try_lock() {
+                        if let Some(cb) = lock.as_mut() {
+                            // The NV21 buffer is tightly packed, so its row
+                            // stride is the width.
+                            cb(nv21.as_ptr(), width, height, width);
+                        }
                     }
                 }
             }

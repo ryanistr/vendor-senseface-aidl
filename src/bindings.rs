@@ -32,4 +32,25 @@ pub use android::hardware::common::NativeHandle::NativeHandle;
 /// Frozen interface identity for face V3, read from
 /// aidl/aidl_api/android.hardware.biometrics.face/3/.hash.
 pub const INTERFACE_HASH: &str = "fca1ab84dda6c013b251270d848eb6d964a6d765";
-pub const INTERFACE_VERSION: i32 = 3;
+// The ROM's framework asks the HAL for its interface version and uses it to pick
+// the session call shapes: version >= 2 selects enrollWithContext, version >= 4
+// selects enrollWithOptions. Both of those need the ROM's extended
+// OperationContext / FaceEnrollOptions parcelables, which carry OPlus-specific
+// nested types that are not in this tree's AIDL snapshot. Version 1 keeps the
+// framework on the plain enroll(hat, byte, byte[], preview) / authenticate(long)
+// calls, whose layouts do match.
+pub const INTERFACE_VERSION: i32 = 1;
+
+/// AIDL reserved transaction codes for `@VintfStability` interfaces.
+///
+/// These are NOT sequential method codes. The framework's own
+/// `android.hardware.biometrics.face.IFace$Stub` declares
+/// `TRANSACTION_getInterfaceHash = 0xfffffe` and
+/// `TRANSACTION_getInterfaceVersion = 0xffffff` (read from the smali of
+/// framework.jar in this ROM), while the frozen V3 `.aidl` snapshot omits both
+/// methods entirely. rsbinder-aidl therefore never generates them, and the calls
+/// would answer `UNKNOWN_TRANSACTION` — which `FaceStartUserClient` treats as a
+/// remote exception and finishes the client without ever authenticating.
+/// `build.rs` injects handlers for these two codes into the generated dispatch.
+pub const GET_INTERFACE_HASH_TRANSACTION: u32 = 0xfffffe;
+pub const GET_INTERFACE_VERSION_TRANSACTION: u32 = 0xffffff;
