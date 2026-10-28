@@ -551,6 +551,11 @@ impl StFace {
         Ok(face_id)
     }
 
+    pub fn clear_roi(&self) -> c_int {
+        let _guard = ALGO_LOCK.lock().unwrap();
+        unsafe { st_auth_set_roi(std::ptr::null()) }
+    }
+
     /// Feed one captured frame for authentication.
     ///
     /// The library reports a match as **201** (0xc9), not 0: the stock HAL's
@@ -559,15 +564,29 @@ impl StFace {
     pub fn unlock(&self, data: &[u8], width: c_int, height: c_int, stride: c_int) -> Result<(), c_int> {
         let _guard = ALGO_LOCK.lock().unwrap();
         let img = StImage::new(data.as_ptr() as *mut u8, width, height, stride);
+        let has_ocular = std::path::Path::new("/data/vendor_de/0/facedata/feature_ocular.data").exists();
+        let primary_mode = if has_ocular { 4 } else { 5 };
         let r = unsafe {
             st_auth_unlock(
                 &img as *const StImage as *mut c_void,
-                UNLOCK_MODE,
+                primary_mode,
                 std::ptr::null_mut(),
                 0,
             )
         };
         if r == UNLOCK_MATCH {
+            return Ok(());
+        }
+        let alt_mode = if primary_mode == 5 { 4 } else { 5 };
+        let r2 = unsafe {
+            st_auth_unlock(
+                &img as *const StImage as *mut c_void,
+                alt_mode,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r2 == UNLOCK_MATCH {
             return Ok(());
         }
         Err(r)

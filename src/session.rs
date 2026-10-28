@@ -114,16 +114,21 @@ fn token_from_handle(handle: &NativeHandle) -> Vec<u8> {
 
 pub struct CancellationSignal {
     pub is_cancelled: Arc<AtomicBool>,
+    pub callback: Option<Strong<dyn ISessionCallback>>,
 }
 
 impl Interface for CancellationSignal {}
 
 impl ICancellationSignal for CancellationSignal {
     fn cancel(&self) -> rsbinder::status::Result<()> {
-        self.is_cancelled.store(true, Ordering::SeqCst);
-        logging::info("session: operation cancelled");
-        close_camera();
-        surface_bridge::clear();
+        if !self.is_cancelled.swap(true, Ordering::SeqCst) {
+            logging::info("session: operation cancelled");
+            close_camera();
+            surface_bridge::clear();
+            if let Some(ref cb) = self.callback {
+                let _ = cb.onError(FaceError::CANCELED, 0);
+            }
+        }
         Ok(())
     }
 }
@@ -194,6 +199,7 @@ impl ISession for FaceSession {
                 self.err(FaceError::UNABLE_TO_PROCESS, 0);
                 return Ok(BnCancellationSignal::new_binder(CancellationSignal {
                     is_cancelled: Arc::new(AtomicBool::new(true)),
+                    callback: None,
                 }));
             }
         };
@@ -207,6 +213,7 @@ impl ISession for FaceSession {
                 self.err(FaceError::UNABLE_TO_PROCESS, 0);
                 return Ok(BnCancellationSignal::new_binder(CancellationSignal {
                     is_cancelled: Arc::new(AtomicBool::new(true)),
+                    callback: None,
                 }));
             }
         }
@@ -293,6 +300,7 @@ impl ISession for FaceSession {
                                 let _ = cb2.onEnrollmentProgress(0, remaining);
                             }
                             Ok(EnrollOutcome::Complete(face_id)) => {
+                                c2.store(true, Ordering::SeqCst);
                                 let n = e2.fetch_add(1, Ordering::SeqCst) + 1;
                                 logging::info(&format!(
                                     "session: enrollment complete after {} samples, face_id={}",
@@ -317,7 +325,10 @@ impl ISession for FaceSession {
             }
         });
 
-        Ok(BnCancellationSignal::new_binder(CancellationSignal { is_cancelled: cancelled }))
+        Ok(BnCancellationSignal::new_binder(CancellationSignal {
+            is_cancelled: cancelled,
+            callback: Some(self.callback.clone()),
+        }))
     }
 
     fn authenticate(&self, operation_id: i64) -> rsbinder::status::Result<Strong<dyn ICancellationSignal>> {
@@ -328,13 +339,22 @@ impl ISession for FaceSession {
                 self.err(FaceError::UNABLE_TO_PROCESS, 0);
                 return Ok(BnCancellationSignal::new_binder(CancellationSignal {
                     is_cancelled: Arc::new(AtomicBool::new(true)),
+                    callback: None,
                 }));
             }
         };
 
+        // Reset algorithm ROI to full frame (matching stock face_authenticate at 0xa574).
+        {
+            let guard = algo.lock().unwrap();
+            let r = guard.clear_roi();
+            logging::info(&format!("session: authenticate cleared roi ret={}", r));
+        }
+
         let cb = self.callback.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancel_flag = cancelled.clone();
+        let user_id = self.user_id as i64;
 
         thread::spawn(move || {
             close_camera();
@@ -355,6 +375,8 @@ impl ISession for FaceSession {
             let a2 = algo.clone();
             let cb2 = cb.clone();
             let start_time = std::time::Instant::now();
+            let frame_counter = Arc::new(AtomicI32::new(0));
+            let fc = frame_counter.clone();
 
             let started = {
                 let mut lock = GLOBAL_CAMERA.lock().unwrap();
@@ -365,6 +387,7 @@ impl ISession for FaceSession {
                         }
                         if start_time.elapsed().as_secs() > 8 {
                             d2.store(true, Ordering::SeqCst);
+                            c2.store(true, Ordering::SeqCst);
                             logging::info("session: authenticate timed out after 8s");
                             let _ = cb2.onError(FaceError::TIMEOUT, 0);
                             close_camera();
@@ -378,19 +401,30 @@ impl ISession for FaceSession {
                         match guard.unlock(frame, w, h, stride) {
                             Ok(()) => {
                                 d2.store(true, Ordering::SeqCst);
+                                c2.store(true, Ordering::SeqCst);
                                 let face_id = guard.get_face_id();
                                 logging::info(&format!("session: authentication succeeded for face_id={}", face_id));
-                                // Weak strength: an empty token (challenge 0, no mac)
-                                // is what the framework expects here.
-                                let hat = HardwareAuthToken::default();
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as i64;
+                                let hat = HardwareAuthToken {
+                                    challenge: operation_id,
+                                    userId: user_id,
+                                    authenticatorId: face_id as i64,
+                                    authenticatorType: crate::bindings::android::hardware::keymaster::HardwareAuthenticatorType::HardwareAuthenticatorType(8),
+                                    timestamp: crate::bindings::android::hardware::keymaster::Timestamp::Timestamp {
+                                        milliSeconds: now_ms,
+                                    },
+                                    mac: vec![0u8; 32],
+                                };
                                 let _ = cb2.onAuthenticationSucceeded(face_id, &hat);
                                 close_camera();
                             }
                             Err(r) => {
-                                // Non-zero is "no match yet", not a fatal error;
-                                // keep scanning until the framework cancels or times out.
-                                if r != stface::ST_OK && r != 1 {
-                                    logging::info(&format!("session: st_auth_unlock ret={}", r));
+                                let count = fc.fetch_add(1, Ordering::SeqCst);
+                                if r != 1 || count % 15 == 0 {
+                                    logging::info(&format!("session: st_auth_unlock ret={} (frame {})", r, count));
                                 }
                             }
                         }
@@ -405,7 +439,10 @@ impl ISession for FaceSession {
             }
         });
 
-        Ok(BnCancellationSignal::new_binder(CancellationSignal { is_cancelled: cancelled }))
+        Ok(BnCancellationSignal::new_binder(CancellationSignal {
+            is_cancelled: cancelled,
+            callback: Some(self.callback.clone()),
+        }))
     }
 
     fn detectInteraction(&self) -> rsbinder::status::Result<Strong<dyn ICancellationSignal>> {
@@ -413,6 +450,7 @@ impl ISession for FaceSession {
         self.err(FaceError::UNABLE_TO_PROCESS, 0);
         Ok(BnCancellationSignal::new_binder(CancellationSignal {
             is_cancelled: Arc::new(AtomicBool::new(true)),
+            callback: None,
         }))
     }
 

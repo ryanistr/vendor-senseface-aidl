@@ -80,6 +80,7 @@ pub struct SurfaceBridge {
     surface: *mut c_void,
     fn_dec_strong: Option<FnRefBaseDecStrong>,
     frames: u64,
+    fail_count: u64,
 }
 
 static PREVIEW: Mutex<Option<SurfaceBridge>> = Mutex::new(None);
@@ -405,18 +406,14 @@ impl SurfaceBridge {
         }
         logging::info(&format!("preview: validated ANativeWindow at {:#x}", anw as usize));
 
-        let geom = unsafe {
-            ANativeWindow_setBuffersGeometry(
-                anw,
-                TARGET_WIDTH,
-                TARGET_HEIGHT,
-                WINDOW_FORMAT_RGBA_8888,
-            )
+        type FnAnwPerform = unsafe extern "C" fn(*mut c_void, i32, ...) -> i32;
+        let fn_perform: FnAnwPerform = unsafe {
+            std::mem::transmute(*((anw as usize + 0x98) as *const *mut c_void))
         };
-        if geom != 0 {
-            logging::info("preview: setBuffersGeometry(RGBA_8888) non-zero, using default");
-            unsafe {
-                ANativeWindow_setBuffersGeometry(anw, 0, 0, 0);
+        for api in 1..=4 {
+            let res = unsafe { fn_perform(anw, 14, api) };
+            if res == 0 {
+                logging::info(&format!("preview: disconnected stale api {}", api));
             }
         }
 
@@ -427,6 +424,7 @@ impl SurfaceBridge {
             surface: surface_mem,
             fn_dec_strong: Some(fn_dec_strong),
             frames: 0,
+            fail_count: 0,
         })
     }
 
@@ -444,10 +442,12 @@ impl SurfaceBridge {
         };
         let locked = unsafe { ANativeWindow_lock(self.native_window, &mut buffer, ptr::null_mut()) };
         if locked != 0 || buffer.bits.is_null() {
-            if self.frames == 0 || self.frames % 30 == 0 {
+            let fails = self.fail_count;
+            self.fail_count += 1;
+            if fails < 5 || fails % 30 == 0 {
                 logging::info(&format!(
-                    "preview: ANativeWindow_lock returned {} (bits={:?})",
-                    locked, buffer.bits
+                    "preview: ANativeWindow_lock failed: {} (bits={:?}, fails={})",
+                    locked, buffer.bits, fails + 1
                 ));
             }
             return -3;
