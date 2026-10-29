@@ -664,27 +664,57 @@ impl SurfaceBridge {
 
         let y_plane = nv21;
         let vu_plane = &nv21[(width * height) as usize..];
-        let max_w = width - 1;
-        let max_h = height - 1;
+
+        // Aspect-ratio preserving center-crop (cover mode).
+        // Sensor portrait orientation: width is sensor height, height is sensor width.
+        let src_pw = height;
+        let src_ph = width;
+
+        let crop_w: i32;
+        let crop_h: i32;
+        let crop_x0: i32;
+        let crop_y0: i32;
+
+        if bw * src_ph > bh * src_pw {
+            crop_w = src_pw;
+            crop_h = (src_pw * bh) / bw;
+            crop_x0 = 0;
+            crop_y0 = (src_ph - crop_h) / 2;
+        } else {
+            crop_h = src_ph;
+            crop_w = (src_ph * bw) / bh;
+            crop_x0 = (src_pw - crop_w) / 2;
+            crop_y0 = 0;
+        }
+
         let denom_w = (bw - 1).max(1);
         let denom_h = (bh - 1).max(1);
+
+        let mut row_y_offs = Vec::with_capacity(bw as usize);
+        let mut row_uv_offs = Vec::with_capacity(bw as usize);
+        for dx in 0..bw {
+            let px = crop_x0 + (dx * (crop_w - 1)) / denom_w;
+            let s_row = px.clamp(0, height - 1) as usize;
+            row_y_offs.push(s_row * width as usize);
+            row_uv_offs.push((s_row >> 1) * width as usize);
+        }
 
         if buffer.format == 4 {
             // WINDOW_FORMAT_RGB_565
             let dst = buffer.bits as *mut u16;
             for dy in 0..bh {
-                let sensor_col = ((max_w * (bh - 1 - dy)) / denom_h) as usize;
+                let py = crop_y0 + (dy * (crop_h - 1)) / denom_h;
+                let sensor_col = ((width - 1) - py).clamp(0, width - 1) as usize;
                 let col_uv_base = (sensor_col >> 1) << 1;
                 let dst_row = unsafe { dst.add(dy as usize * stride as usize) };
-                for dx in 0..bw {
-                    let sensor_row = ((max_h * dx) / denom_w) as usize;
-                    let y_val = y_plane[sensor_col + sensor_row * width as usize];
-                    let uv_idx = (sensor_row >> 1) * width as usize + col_uv_base;
+                for dx in 0..bw as usize {
+                    let y_val = y_plane[sensor_col + row_y_offs[dx]];
+                    let uv_idx = row_uv_offs[dx] + col_uv_base;
                     let v_val = vu_plane[uv_idx];
                     let u_val = vu_plane[uv_idx + 1];
                     let (r, g, b) = yuv_to_rgb(y_val, u_val, v_val);
                     unsafe {
-                        *dst_row.add(dx as usize) =
+                        *dst_row.add(dx) =
                             (((r >> 3) as u16) << 11) | (((g >> 2) as u16) << 5) | ((b >> 3) as u16);
                     }
                 }
@@ -693,18 +723,18 @@ impl SurfaceBridge {
             // WINDOW_FORMAT_RGBA_8888 or RGBX_8888
             let dst = buffer.bits as *mut u32;
             for dy in 0..bh {
-                let sensor_col = ((max_w * (bh - 1 - dy)) / denom_h) as usize;
+                let py = crop_y0 + (dy * (crop_h - 1)) / denom_h;
+                let sensor_col = ((width - 1) - py).clamp(0, width - 1) as usize;
                 let col_uv_base = (sensor_col >> 1) << 1;
                 let dst_row = unsafe { dst.add(dy as usize * stride as usize) };
-                for dx in 0..bw {
-                    let sensor_row = ((max_h * dx) / denom_w) as usize;
-                    let y_val = y_plane[sensor_col + sensor_row * width as usize];
-                    let uv_idx = (sensor_row >> 1) * width as usize + col_uv_base;
+                for dx in 0..bw as usize {
+                    let y_val = y_plane[sensor_col + row_y_offs[dx]];
+                    let uv_idx = row_uv_offs[dx] + col_uv_base;
                     let v_val = vu_plane[uv_idx];
                     let u_val = vu_plane[uv_idx + 1];
                     let (r, g, b) = yuv_to_rgb(y_val, u_val, v_val);
                     unsafe {
-                        *dst_row.add(dx as usize) =
+                        *dst_row.add(dx) =
                             0xFF00_0000 | ((b as u32) << 16) | ((g as u32) << 8) | r as u32;
                     }
                 }
@@ -738,6 +768,7 @@ impl Drop for SurfaceBridge {
     }
 }
 
+#[inline(always)]
 fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (i32, i32, i32) {
     let c = (y as i32 - 16).max(0);
     let d = u as i32 - 128;

@@ -114,6 +114,7 @@ fn token_from_handle(handle: &NativeHandle) -> Vec<u8> {
 
 pub struct CancellationSignal {
     pub is_cancelled: Arc<AtomicBool>,
+    pub is_completed: Arc<AtomicBool>,
     pub callback: Option<Strong<dyn ISessionCallback>>,
 }
 
@@ -127,8 +128,10 @@ impl ICancellationSignal for CancellationSignal {
                 close_camera();
                 surface_bridge::clear();
             });
-            if let Some(ref cb) = self.callback {
-                let _ = cb.onError(FaceError::CANCELED, 0);
+            if !self.is_completed.load(Ordering::SeqCst) {
+                if let Some(ref cb) = self.callback {
+                    let _ = cb.onError(FaceError::CANCELED, 0);
+                }
             }
         }
         Ok(())
@@ -201,6 +204,7 @@ impl ISession for FaceSession {
                 self.err(FaceError::UNABLE_TO_PROCESS, 0);
                 return Ok(BnCancellationSignal::new_binder(CancellationSignal {
                     is_cancelled: Arc::new(AtomicBool::new(true)),
+                    is_completed: Arc::new(AtomicBool::new(false)),
                     callback: None,
                 }));
             }
@@ -215,6 +219,7 @@ impl ISession for FaceSession {
                 self.err(FaceError::UNABLE_TO_PROCESS, 0);
                 return Ok(BnCancellationSignal::new_binder(CancellationSignal {
                     is_cancelled: Arc::new(AtomicBool::new(true)),
+                    is_completed: Arc::new(AtomicBool::new(false)),
                     callback: None,
                 }));
             }
@@ -236,7 +241,9 @@ impl ISession for FaceSession {
 
         let cb = self.callback.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
         let cancel_flag = cancelled.clone();
+        let complete_flag = completed.clone();
         let total = enroll_frames();
 
         thread::spawn(move || {
@@ -255,6 +262,7 @@ impl ISession for FaceSession {
             let enrolled = Arc::new(AtomicI32::new(0));
             let e2 = enrolled.clone();
             let c2 = cancel_flag.clone();
+            let comp2 = complete_flag.clone();
             let a2 = algo.clone();
             let cb2 = cb.clone();
             let last_sample_time = Arc::new(Mutex::new(std::time::Instant::now()));
@@ -275,21 +283,24 @@ impl ISession for FaceSession {
                         if c2.load(Ordering::SeqCst) {
                             return;
                         }
-                        if e2.load(Ordering::SeqCst) >= total {
-                            return;
-                        }
+
                         // The algorithm library consumes NV21: the Y plane
                         // followed by the interleaved V and U planes.
                         let frame = unsafe {
                             std::slice::from_raw_parts(data, (w * h * 3 / 2) as usize)
                         };
+
                         // Draw the frame into the preview surface on every single camera frame.
                         surface_bridge::render_current(frame, w, h);
+
+                        if e2.load(Ordering::SeqCst) >= total {
+                            return;
+                        }
 
                         // Pace enrollment samples so the UI circle and camera preview have time to show.
                         {
                             let mut t_lock = lst.lock().unwrap();
-                            if t_lock.elapsed().as_millis() < 300 {
+                            if t_lock.elapsed().as_millis() < 600 {
                                 return;
                             }
                             *t_lock = std::time::Instant::now();
@@ -311,19 +322,25 @@ impl ISession for FaceSession {
                                 let _ = cb2.onEnrollmentProgress(cur_id, remaining);
                             }
                             Ok(EnrollOutcome::Complete(face_id)) => {
-                                let n = e2.load(Ordering::SeqCst) + 1;
                                 let final_id = if face_id > 0 { face_id } else { 1 };
                                 eid.store(final_id, Ordering::SeqCst);
                                 e2.store(total, Ordering::SeqCst);
-                                c2.store(true, Ordering::SeqCst);
+                                comp2.store(true, Ordering::SeqCst);
                                 logging::info(&format!(
                                     "session: enrollment complete after {} samples, face_id={}",
-                                    n, final_id
+                                    total, final_id
                                 ));
                                 let _ = cb2.onEnrollmentProgress(final_id, 0);
-                                thread::spawn(|| {
-                                    close_camera();
-                                    surface_bridge::clear();
+
+                                // Safety timeout: if framework does not close the session within 10s, release camera.
+                                let c3 = c2.clone();
+                                thread::spawn(move || {
+                                    thread::sleep(std::time::Duration::from_secs(10));
+                                    if !c3.swap(true, Ordering::SeqCst) {
+                                        logging::info("session: enroll safety timeout closing camera");
+                                        close_camera();
+                                        surface_bridge::clear();
+                                    }
                                 });
                             }
                             Err(r) => {
@@ -345,6 +362,7 @@ impl ISession for FaceSession {
 
         Ok(BnCancellationSignal::new_binder(CancellationSignal {
             is_cancelled: cancelled,
+            is_completed: completed,
             callback: Some(self.callback.clone()),
         }))
     }
@@ -357,6 +375,7 @@ impl ISession for FaceSession {
                 self.err(FaceError::UNABLE_TO_PROCESS, 0);
                 return Ok(BnCancellationSignal::new_binder(CancellationSignal {
                     is_cancelled: Arc::new(AtomicBool::new(true)),
+                    is_completed: Arc::new(AtomicBool::new(false)),
                     callback: None,
                 }));
             }
@@ -371,7 +390,9 @@ impl ISession for FaceSession {
 
         let cb = self.callback.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
         let cancel_flag = cancelled.clone();
+        let done_flag = done.clone();
         let user_id = self.user_id as i64;
 
         thread::spawn(move || {
@@ -387,8 +408,7 @@ impl ISession for FaceSession {
                 *lock = Some(cam);
             }
 
-            let done = Arc::new(AtomicBool::new(false));
-            let d2 = done.clone();
+            let d2 = done_flag.clone();
             let c2 = cancel_flag.clone();
             let a2 = algo.clone();
             let cb2 = cb.clone();
@@ -464,6 +484,7 @@ impl ISession for FaceSession {
 
         Ok(BnCancellationSignal::new_binder(CancellationSignal {
             is_cancelled: cancelled,
+            is_completed: done,
             callback: Some(self.callback.clone()),
         }))
     }
@@ -473,6 +494,7 @@ impl ISession for FaceSession {
         self.err(FaceError::UNABLE_TO_PROCESS, 0);
         Ok(BnCancellationSignal::new_binder(CancellationSignal {
             is_cancelled: Arc::new(AtomicBool::new(true)),
+            is_completed: Arc::new(AtomicBool::new(false)),
             callback: None,
         }))
     }

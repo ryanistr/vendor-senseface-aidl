@@ -3,9 +3,11 @@
 // logcat output under the tag the stock HIDL HAL used ("FaceHalHW"), so the
 // AIDL HAL's lines land in the same place anyone debugging face unlock looks.
 use std::os::raw::{c_char, c_int, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
 static INIT: Once = Once::new();
+static VERBOSE: AtomicBool = AtomicBool::new(true);
 
 extern "C" {
     fn __android_log_print(prio: c_int, tag: *const c_char, fmt: *const c_char, ...) -> c_int;
@@ -15,10 +17,10 @@ extern "C" {
 const ANDROID_LOG_INFO: c_int = 4;
 const ANDROID_LOG_ERROR: c_int = 6;
 
+#[allow(dead_code)]
 pub const TAG: &[u8] = b"FaceHalHW\0";
 
-/// Separate tag for rsbinder's own diagnostics, so its messages are
-/// distinguishable from the HAL's.
+#[allow(dead_code)]
 const RSBINDER_TAG: &[u8] = b"FaceHalRsb\0";
 
 pub fn get_prop(name: &[u8]) -> Option<String> {
@@ -41,10 +43,7 @@ pub fn get_prop(name: &[u8]) -> Option<String> {
 /// writes every frame is a battery complaint. `persist.sys.facehal.verbose=1`
 /// turns it on, mirroring how the stock HAL gates its own traces.
 pub fn verbose() -> bool {
-    matches!(
-        get_prop(b"persist.sys.facehal.verbose\0").as_deref(),
-        None | Some("1") | Some("true") | Some("y") | Some("on")
-    )
+    VERBOSE.load(Ordering::Relaxed)
 }
 
 pub fn info(msg: &str) {
@@ -80,6 +79,7 @@ pub fn error(msg: &str) {
 /// logger installed those messages are dropped, so a transaction that fails
 /// during unmarshal looks identical to one that never arrived. Forward them to
 /// logcat under a distinct tag so they are distinguishable from our own lines.
+#[allow(dead_code)]
 struct RsbinderLogger;
 
 impl log::Log for RsbinderLogger {
@@ -94,8 +94,10 @@ impl log::Log for RsbinderLogger {
     fn flush(&self) {}
 }
 
+#[allow(dead_code)]
 static RSBINDER_LOGGER: RsbinderLogger = RsbinderLogger;
 
+#[allow(dead_code)]
 fn rsbinder_log(msg: &str) {
     if let Ok(c) = std::ffi::CString::new(msg) {
         unsafe {
@@ -109,8 +111,7 @@ fn rsbinder_log(msg: &str) {
     }
 }
 
-/// Install the `log` logger rsbinder writes to. Idempotent: a second call is
-/// ignored rather than panicking on the global logger slot.
+#[allow(dead_code)]
 pub fn init_rsbinder_logger() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -119,10 +120,14 @@ pub fn init_rsbinder_logger() {
     });
 }
 
-/// Keep the Once alive so `verbose()` stays a one-shot read of the property.
+/// Initialize verbose logging flag from system property once at startup.
 pub fn init() {
     INIT.call_once(|| {
-        let _ = verbose();
+        let v = matches!(
+            get_prop(b"persist.sys.facehal.verbose\0").as_deref(),
+            None | Some("1") | Some("true") | Some("y") | Some("on")
+        );
+        VERBOSE.store(v, Ordering::SeqCst);
     });
 }
 
