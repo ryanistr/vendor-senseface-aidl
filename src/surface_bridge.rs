@@ -347,6 +347,62 @@ fn is_valid_native_window(anw: *mut c_void) -> bool {
     }
 }
 
+static TEXT_PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+unsafe fn patch_bqc_text(conv_base: usize) {
+    if TEXT_PATCHED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+
+    let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+    let text_page = (conv_base + 0x1000) & !(page_size - 1);
+
+    if libc::mprotect(
+        text_page as *mut libc::c_void,
+        page_size,
+        libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+    ) != 0 {
+        logging::error("preview: failed to make bqc .text writable");
+        return;
+    }
+
+    let p_alloc = (conv_base + 0x10c0) as *mut u32;
+    let p_vtab1 = (conv_base + 0x12b8) as *mut u32;
+    let p_vtab2 = (conv_base + 0x12bc) as *mut u32;
+
+    logging::info(&format!(
+        "preview: original bqc opcodes: alloc={:#x}, vtab1={:#x}, vtab2={:#x}",
+        *p_alloc, *p_vtab1, *p_vtab2
+    ));
+
+    // mov w0, #0x20e0 (8416 bytes for Android 15 Surface)
+    *p_alloc = 0x5284_1c00;
+    // add x10, x8, #0x258 (Android 15 RefBase vtable)
+    *p_vtab1 = 0x9109_610a;
+    // add x8, x8, #0x198 (Android 15 BBinder vtable)
+    *p_vtab2 = 0x9106_6108;
+
+    libc::mprotect(
+        text_page as *mut libc::c_void,
+        page_size,
+        libc::PROT_READ | libc::PROT_EXEC,
+    );
+
+    core::arch::asm!(
+        "dc cvau, {p1}",
+        "dc cvau, {p2}",
+        "dsb ish",
+        "ic ivau, {p1}",
+        "ic ivau, {p2}",
+        "dsb ish",
+        "isb",
+        p1 = in(reg) (conv_base + 0x10c0),
+        p2 = in(reg) (conv_base + 0x12b8),
+    );
+
+    logging::info("preview: patched bqc .text for Android 15 Surface and vtables");
+}
+
 impl SurfaceBridge {
     pub fn create(token: &[u8]) -> Option<SurfaceBridge> {
         if token.is_empty() {
@@ -447,6 +503,8 @@ impl SurfaceBridge {
         }
         let conv_base = dlinfo.dli_fbase as usize;
         logging::info(&format!("preview: libbufferqueueconverter base address: {:#x}", conv_base));
+
+        unsafe { patch_bqc_text(conv_base); }
 
         // When producer is V1_0, patch libbufferqueueconverter's GOT to use V1_0 H2BGraphicBufferProducer
         // GOT slots 0x2240 (ZTT) and 0x2248 (ZTV).

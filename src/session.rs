@@ -123,8 +123,10 @@ impl ICancellationSignal for CancellationSignal {
     fn cancel(&self) -> rsbinder::status::Result<()> {
         if !self.is_cancelled.swap(true, Ordering::SeqCst) {
             logging::info("session: operation cancelled");
-            close_camera();
-            surface_bridge::clear();
+            thread::spawn(|| {
+                close_camera();
+                surface_bridge::clear();
+            });
             if let Some(ref cb) = self.callback {
                 let _ = cb.onError(FaceError::CANCELED, 0);
             }
@@ -319,8 +321,10 @@ impl ISession for FaceSession {
                                     n, final_id
                                 ));
                                 let _ = cb2.onEnrollmentProgress(final_id, 0);
-                                close_camera();
-                                surface_bridge::clear();
+                                thread::spawn(|| {
+                                    close_camera();
+                                    surface_bridge::clear();
+                                });
                             }
                             Err(r) => {
                                 if r != 1 {
@@ -404,7 +408,9 @@ impl ISession for FaceSession {
                             c2.store(true, Ordering::SeqCst);
                             logging::info("session: authenticate timed out after 8s");
                             let _ = cb2.onError(FaceError::TIMEOUT, 0);
-                            close_camera();
+                            thread::spawn(|| {
+                                close_camera();
+                            });
                             return;
                         }
 
@@ -434,7 +440,9 @@ impl ISession for FaceSession {
                                     mac: vec![0u8; 32],
                                 };
                                 let _ = cb2.onAuthenticationSucceeded(face_id, &hat);
-                                close_camera();
+                                thread::spawn(|| {
+                                    close_camera();
+                                });
                             }
                             Err(r) => {
                                 let count = fc.fetch_add(1, Ordering::SeqCst);
