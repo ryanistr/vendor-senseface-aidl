@@ -419,12 +419,6 @@ impl StFace {
     pub fn prepare_enroll(&self) -> Result<(), c_int> {
         let _guard = ALGO_LOCK.lock().unwrap();
 
-        let r = unsafe { st_auth_set_faceid_image_number(ENROLL_IMAGE_COUNT) };
-        if r != ST_OK {
-            logging::error(&format!("stface: st_auth_set_faceid_image_number ret={}", r));
-            return Err(r);
-        }
-
         let r = unsafe { st_auth_reset() };
         if r != ST_OK {
             logging::error(&format!("stface: st_auth_reset ret={}", r));
@@ -451,6 +445,16 @@ impl StFace {
             logging::error(&format!("stface: st_auth_set_roi ret={}", r));
             return Err(r);
         }
+
+        // Must be called after st_auth_reset, which resets image number to 1.
+        let r = unsafe { st_auth_set_faceid_image_number(ENROLL_IMAGE_COUNT) };
+        if r != ST_OK {
+            logging::error(&format!("stface: st_auth_set_faceid_image_number ret={}", r));
+            return Err(r);
+        }
+        logging::info(&format!("stface: set_faceid_image_number({}) ret={}", ENROLL_IMAGE_COUNT, r));
+
+        self.last_face_id.store(-1, std::sync::atomic::Ordering::SeqCst);
 
         logging::info(&format!(
             "stface: enrollment prepared (roi {} {} {} {})",
@@ -494,7 +498,7 @@ impl StFace {
                 face_id
             } else {
                 let fid = self.get_face_id();
-                if fid > 0 { fid } else { 11 }
+                if fid > 0 { fid } else { 1 }
             };
             self.last_face_id
                 .store(id, std::sync::atomic::Ordering::SeqCst);
@@ -564,7 +568,8 @@ impl StFace {
     pub fn unlock(&self, data: &[u8], width: c_int, height: c_int, stride: c_int) -> Result<(), c_int> {
         let _guard = ALGO_LOCK.lock().unwrap();
         let img = StImage::new(data.as_ptr() as *mut u8, width, height, stride);
-        let has_ocular = std::path::Path::new("/data/vendor_de/0/facedata/feature_ocular.data").exists();
+        let has_ocular = std::path::Path::new("/data/vendor_de/0/facedata/feature_ocular.txt").exists()
+            || std::path::Path::new("/data/vendor_de/0/facedata/feature_ocular.data").exists();
         let primary_mode = if has_ocular { 4 } else { 5 };
         let r = unsafe {
             st_auth_unlock(
@@ -633,7 +638,7 @@ impl StFace {
                 }
             }
         }
-        11
+        1
     }
 
     pub fn has_enrolled_face(&self) -> bool {
@@ -646,11 +651,15 @@ impl StFace {
 
     pub fn delete_face(&self, face_id: i32) -> c_int {
         let _guard = ALGO_LOCK.lock().unwrap();
+        if self.last_face_id.load(std::sync::atomic::Ordering::SeqCst) == face_id {
+            self.last_face_id.store(-1, std::sync::atomic::Ordering::SeqCst);
+        }
         unsafe { st_auth_delete_face(face_id) }
     }
 
     pub fn delete_all(&self) -> c_int {
         let _guard = ALGO_LOCK.lock().unwrap();
+        self.last_face_id.store(-1, std::sync::atomic::Ordering::SeqCst);
         unsafe { st_auth_delete_all_face() }
     }
 

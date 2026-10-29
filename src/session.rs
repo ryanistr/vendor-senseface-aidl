@@ -257,6 +257,14 @@ impl ISession for FaceSession {
             let cb2 = cb.clone();
             let last_sample_time = Arc::new(Mutex::new(std::time::Instant::now()));
             let lst = last_sample_time.clone();
+            let enroll_id = Arc::new(AtomicI32::new(1));
+            let eid = enroll_id.clone();
+
+            {
+                let guard = a2.lock().unwrap();
+                let r = guard.set_faceid_image_number(total);
+                logging::info(&format!("session: enroll set_faceid_image_number({}) ret={}", total, r));
+            }
 
             let started = {
                 let mut lock = GLOBAL_CAMERA.lock().unwrap();
@@ -279,7 +287,7 @@ impl ISession for FaceSession {
                         // Pace enrollment samples so the UI circle and camera preview have time to show.
                         {
                             let mut t_lock = lst.lock().unwrap();
-                            if t_lock.elapsed().as_millis() < 250 {
+                            if t_lock.elapsed().as_millis() < 300 {
                                 return;
                             }
                             *t_lock = std::time::Instant::now();
@@ -294,24 +302,30 @@ impl ISession for FaceSession {
                                 let n = e2.fetch_add(1, Ordering::SeqCst) + 1;
                                 let remaining = (total - n).max(0);
                                 logging::info(&format!(
-                                    "session: enroll sample {}/{} accepted",
-                                    n, total
+                                    "session: enroll sample {}/{} accepted (remaining={})",
+                                    n, total, remaining
                                 ));
-                                let _ = cb2.onEnrollmentProgress(0, remaining);
+                                let cur_id = eid.load(Ordering::SeqCst);
+                                let _ = cb2.onEnrollmentProgress(cur_id, remaining);
                             }
                             Ok(EnrollOutcome::Complete(face_id)) => {
+                                let n = e2.load(Ordering::SeqCst) + 1;
+                                let final_id = if face_id > 0 { face_id } else { 1 };
+                                eid.store(final_id, Ordering::SeqCst);
+                                e2.store(total, Ordering::SeqCst);
                                 c2.store(true, Ordering::SeqCst);
-                                let n = e2.fetch_add(1, Ordering::SeqCst) + 1;
                                 logging::info(&format!(
                                     "session: enrollment complete after {} samples, face_id={}",
-                                    n, face_id
+                                    n, final_id
                                 ));
-                                let _ = cb2.onEnrollmentProgress(face_id, 0);
+                                let _ = cb2.onEnrollmentProgress(final_id, 0);
                                 close_camera();
                                 surface_bridge::clear();
                             }
                             Err(r) => {
-                                logging::error(&format!("session: st_auth_enroll ret={}", r));
+                                if r != 1 {
+                                    logging::info(&format!("session: st_auth_enroll ret={}", r));
+                                }
                             }
                         }
                     }),
@@ -402,7 +416,8 @@ impl ISession for FaceSession {
                             Ok(()) => {
                                 d2.store(true, Ordering::SeqCst);
                                 c2.store(true, Ordering::SeqCst);
-                                let face_id = guard.get_face_id();
+                                let fid = guard.get_face_id();
+                                let face_id = if fid > 0 { fid } else { 1 };
                                 logging::info(&format!("session: authentication succeeded for face_id={}", face_id));
                                 let now_ms = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
