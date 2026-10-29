@@ -31,6 +31,7 @@ fn main() {
     // Default driver + a thread pool sized for the camera callback path.
     ProcessState::init_default();
     ProcessState::start_thread_pool();
+    surface_bridge::init_hidl_thread_pool();
 
     let service = FaceHal::new();
     let binder = BnFace::new_binder(service);

@@ -558,17 +558,6 @@ impl SurfaceBridge {
         }
         logging::info(&format!("preview: validated ANativeWindow at {:#x}", anw as usize));
 
-        type FnAnwPerform = unsafe extern "C" fn(*mut c_void, i32, ...) -> i32;
-        let fn_perform: FnAnwPerform = unsafe {
-            std::mem::transmute(*((anw as usize + 0x98) as *const *mut c_void))
-        };
-        for api in 1..=4 {
-            let res = unsafe { fn_perform(anw, 14, api) };
-            if res == 0 {
-                logging::info(&format!("preview: disconnected stale api {}", api));
-            }
-        }
-
         logging::info("preview: surface bridge successfully established via libbufferqueueconverter");
 
         Some(SurfaceBridge {
@@ -608,7 +597,10 @@ impl SurfaceBridge {
         let bh = buffer.height;
         let stride = buffer.stride;
         if bw <= 0 || bh <= 0 || stride <= 0 {
-            unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+            let res = unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+            if res != 0 {
+                logging::error(&format!("preview: unlockAndPost err: {}", res));
+            }
             return -5;
         }
 
@@ -661,7 +653,10 @@ impl SurfaceBridge {
             }
         }
 
-        unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+        let post_res = unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+        if post_res != 0 {
+            logging::error(&format!("preview: ANativeWindow_unlockAndPost failed: {}", post_res));
+        }
         self.frames += 1;
         if self.frames == 1 || self.frames % 5 == 0 {
             logging::info(&format!(
@@ -709,5 +704,35 @@ pub fn render_current(nv21: &[u8], width: i32, height: i32) {
     let mut slot = PREVIEW.lock().unwrap();
     if let Some(bridge) = slot.as_mut() {
         bridge.render_nv21(nv21, width, height);
+    }
+}
+
+pub fn init_hidl_thread_pool() {
+    let lib = load_lib(&["/system/lib64/libhidlbase.so", "libhidlbase.so"]);
+    let handle = match lib {
+        Some(h) => h,
+        None => {
+            logging::error("hidl: could not dlopen libhidlbase.so");
+            return;
+        }
+    };
+
+    type FnConfig = unsafe extern "C" fn(usize, bool);
+    if let Some(sym) = symbol(handle, "_ZN7android8hardware22configureRpcThreadpoolEmb") {
+        let fn_config: FnConfig = unsafe { std::mem::transmute(sym) };
+        unsafe { fn_config(4, false) };
+        logging::info("hidl: configureRpcThreadpool(4, false) ok");
+    }
+
+    type FnJoin = unsafe extern "C" fn();
+    if let Some(sym) = symbol(handle, "_ZN7android8hardware17joinRpcThreadpoolEv") {
+        let fn_join: FnJoin = unsafe { std::mem::transmute(sym) };
+        std::thread::Builder::new()
+            .name("hwbinder".into())
+            .spawn(move || {
+                logging::info("hidl: hwbinder worker thread started");
+                unsafe { fn_join() };
+            })
+            .ok();
     }
 }
