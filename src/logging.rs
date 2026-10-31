@@ -123,9 +123,9 @@ pub fn init_rsbinder_logger() {
 /// Initialize verbose logging flag from system property once at startup.
 pub fn init() {
     INIT.call_once(|| {
-        let v = matches!(
+        let v = !matches!(
             get_prop(b"persist.sys.facehal.verbose\0").as_deref(),
-            None | Some("1") | Some("true") | Some("y") | Some("on")
+            Some("0") | Some("false") | Some("n") | Some("off")
         );
         VERBOSE.store(v, Ordering::SeqCst);
     });

@@ -283,7 +283,7 @@ impl ISession for FaceSession {
             if !cam.open(&camera_id()) {
                 logging::error("session: enroll could not open camera");
                 surface_bridge::clear();
-                let _ = cb.onError(FaceError::UNABLE_TO_PROCESS, 0);
+                let _ = cb.onError(FaceError::TIMEOUT, 0);
                 return;
             }
             {
@@ -322,13 +322,14 @@ impl ISession for FaceSession {
                 logging::error("session: enroll capture did not start");
                 close_camera();
                 surface_bridge::clear();
-                let _ = cb.onError(FaceError::UNABLE_TO_PROCESS, 0);
+                let _ = cb.onError(FaceError::TIMEOUT, 0);
                 return;
             }
 
             let start_time = Instant::now();
-            let mut next_sample_at = start_time + Duration::from_millis(700);
-            let mut enrolled_count = 0i32;
+            let mut visual_stage = 0i32;
+            let mut enrolled_face_id: Option<i32> = None;
+            let mut next_sample_at = start_time + Duration::from_millis(600);
 
             loop {
                 if cancel_flag.load(Ordering::SeqCst) {
@@ -371,39 +372,66 @@ impl ISession for FaceSession {
                     break;
                 }
 
-                let outcome = {
+                let outcome = if enrolled_face_id.is_none() {
                     let guard = algo.lock().unwrap();
                     guard.enroll(&frame_bytes, w, h, stride)
+                } else {
+                    Ok(EnrollOutcome::Accepted)
                 };
 
                 match outcome {
                     Ok(EnrollOutcome::Accepted) => {
-                        enrolled_count += 1;
-                        let remaining = (total - enrolled_count).max(1);
-                        logging::info(&format!(
-                            "session: enroll sample {}/{} accepted (remaining={})",
-                            enrolled_count, total, remaining
-                        ));
-                        let _ = cb.onEnrollmentProgress(1, remaining);
-                        // Sample 1 triggers FaceEnrollNewActivity.onEnrollProgressStart (600ms delay + 450ms fade-in + 560ms 0->20% ring).
-                        let delay_ms = if enrolled_count == 1 { 1600 } else { 650 };
-                        next_sample_at = Instant::now() + Duration::from_millis(delay_ms);
+                        visual_stage += 1;
+                        let remaining = total - visual_stage;
+                        if remaining > 0 {
+                            logging::info(&format!(
+                                "session: enroll visual stage {}/{} (remaining={})",
+                                visual_stage, total, remaining
+                            ));
+                            let _ = cb.onEnrollmentProgress(1, remaining);
+                            let delay_ms = if visual_stage == 1 { 1400 } else { 650 };
+                            next_sample_at = Instant::now() + Duration::from_millis(delay_ms);
+                        } else {
+                            let final_id = enrolled_face_id.unwrap_or(1);
+                            complete_flag.store(true, Ordering::SeqCst);
+                            logging::info(&format!(
+                                "session: enrollment visual stages finished, face_id={}",
+                                final_id
+                            ));
+                            let _ = cb.onEnrollmentProgress(final_id, 0);
+                            let slot = latest_frame.lock().unwrap();
+                            let _ = notify_worker
+                                .wait_timeout(slot, Duration::from_millis(650))
+                                .unwrap();
+                            break;
+                        }
                     }
                     Ok(EnrollOutcome::Complete(face_id)) => {
-                        let final_id = if face_id > 0 { face_id } else { 1 };
-                        enrolled_count = total;
-                        complete_flag.store(true, Ordering::SeqCst);
-                        logging::info(&format!(
-                            "session: enrollment complete after {} samples, face_id={}",
-                             enrolled_count, final_id
-                        ));
-                        let _ = cb.onEnrollmentProgress(final_id, 0);
-                        // Allow the final 80%->100% UI ring transition (560ms) to finish before teardown.
-                        let slot = latest_frame.lock().unwrap();
-                        let _ = notify_worker
-                            .wait_timeout(slot, Duration::from_millis(600))
-                            .unwrap();
-                        break;
+                        let id = if face_id > 0 { face_id } else { 1 };
+                        enrolled_face_id = Some(id);
+                        visual_stage += 1;
+                        let remaining = total - visual_stage;
+                        if remaining > 0 {
+                            logging::info(&format!(
+                                "session: enroll algorithm completed with id={}, visual stage {}/{} (remaining={})",
+                                id, visual_stage, total, remaining
+                            ));
+                            let _ = cb.onEnrollmentProgress(1, remaining);
+                            let delay_ms = if visual_stage == 1 { 1400 } else { 650 };
+                            next_sample_at = Instant::now() + Duration::from_millis(delay_ms);
+                        } else {
+                            complete_flag.store(true, Ordering::SeqCst);
+                            logging::info(&format!(
+                                "session: enrollment complete, face_id={}",
+                                id
+                            ));
+                            let _ = cb.onEnrollmentProgress(id, 0);
+                            let slot = latest_frame.lock().unwrap();
+                            let _ = notify_worker
+                                .wait_timeout(slot, Duration::from_millis(650))
+                                .unwrap();
+                            break;
+                        }
                     }
                     Err(r) => {
                         if r != 1 {
@@ -471,7 +499,7 @@ impl ISession for FaceSession {
             let mut cam = CameraEngine::new();
             if !cam.open(&camera_id()) {
                 logging::error("session: authenticate could not open camera");
-                let _ = cb.onError(FaceError::UNABLE_TO_PROCESS, 0);
+                let _ = cb.onError(FaceError::TIMEOUT, 0);
                 return;
             }
             {
@@ -506,7 +534,7 @@ impl ISession for FaceSession {
             if !started {
                 logging::error("session: authenticate capture did not start");
                 close_camera();
-                let _ = cb.onError(FaceError::UNABLE_TO_PROCESS, 0);
+                let _ = cb.onError(FaceError::TIMEOUT, 0);
                 return;
             }
 
@@ -517,12 +545,11 @@ impl ISession for FaceSession {
                 if cancel_flag.load(Ordering::SeqCst) || done_flag.load(Ordering::SeqCst) {
                     break;
                 }
-                if start_time.elapsed() > Duration::from_secs(8) {
+                if start_time.elapsed() > Duration::from_millis(3500) {
                     done_flag.store(true, Ordering::SeqCst);
-                    if !cancel_flag.swap(true, Ordering::SeqCst) {
-                        logging::info("session: authenticate timed out after 8s");
-                        let _ = cb.onError(FaceError::TIMEOUT, 0);
-                    }
+                    cancel_flag.store(true, Ordering::SeqCst);
+                    logging::info("session: authenticate 3.5s elapsed without match -> onAuthenticationFailed");
+                    let _ = cb.onAuthenticationFailed();
                     break;
                 }
 

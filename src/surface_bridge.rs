@@ -616,6 +616,11 @@ impl SurfaceBridge {
         }
         logging::info(&format!("preview: validated ANativeWindow at {:#x}", anw as usize));
 
+        let geom = unsafe {
+            ANativeWindow_setBuffersGeometry(anw, 480, 480, 1)
+        };
+        logging::info(&format!("preview: ANativeWindow_setBuffersGeometry(480, 480, RGBA_8888) ret={}", geom));
+
         logging::info("preview: surface bridge successfully established via libbufferqueueconverter");
 
         Some(SurfaceBridge {

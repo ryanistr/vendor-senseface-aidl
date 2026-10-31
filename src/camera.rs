@@ -315,15 +315,30 @@ impl CameraEngine {
             Ok(c) => c,
             Err(_) => return false,
         };
-        let res = unsafe {
-            ACameraManager_openCamera(self.manager, id_c.as_ptr(), &mut *self.device_callbacks, &mut self.device)
-        };
-        if res != ACAMERA_OK || self.device.is_null() {
-            logging::error(&format!("camera: open {} failed ret={}", camera_id, res));
-            return false;
+        let mut res = ACAMERA_OK;
+        for attempt in 0..10 {
+            res = unsafe {
+                ACameraManager_openCamera(
+                    self.manager,
+                    id_c.as_ptr(),
+                    &mut *self.device_callbacks,
+                    &mut self.device,
+                )
+            };
+            if res == ACAMERA_OK && !self.device.is_null() {
+                logging::info(&format!("camera: opened {} (attempt {})", camera_id, attempt + 1));
+                return true;
+            }
+            logging::info(&format!(
+                "camera: open {} attempt {} ret={}, retrying in 60ms...",
+                camera_id,
+                attempt + 1,
+                res
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(60));
         }
-        logging::info(&format!("camera: opened {}", camera_id));
-        true
+        logging::error(&format!("camera: open {} failed ret={}", camera_id, res));
+        false
     }
 
     pub fn start_capture<F>(&mut self, width: i32, height: i32, callback: F) -> bool
@@ -586,6 +601,8 @@ impl Drop for CameraEngine {
             if !self.device.is_null() {
                 ACameraDevice_close(self.device);
                 self.device = ptr::null_mut();
+                // Allow cameraserver to process close before another open starts.
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             if !self.window.is_null() {
                 ANativeWindow_release(self.window);
