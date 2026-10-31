@@ -197,6 +197,7 @@ pub struct SurfaceBridge {
     fn_destroy: Option<FnDestroySurfaceHolder>,
     frames: u64,
     fail_count: u64,
+    last_post: std::time::Instant,
 }
 
 static PREVIEW: Mutex<Option<SurfaceBridge>> = Mutex::new(None);
@@ -621,6 +622,16 @@ impl SurfaceBridge {
         };
         logging::info(&format!("preview: ANativeWindow_setBuffersGeometry(480, 480, RGBA_8888) ret={}", geom));
 
+        let libnative = load_lib(&["libnativewindow.so", "/system/lib64/libnativewindow.so"]);
+        if let Some(h) = libnative {
+            type FnSetDequeueTimeout = unsafe extern "C" fn(*mut c_void, i64) -> i32;
+            if let Some(sym) = symbol(h, "ANativeWindow_setDequeueTimeout") {
+                let fn_timeout: FnSetDequeueTimeout = unsafe { std::mem::transmute(sym) };
+                let ret = unsafe { fn_timeout(anw, 50_000_000) };
+                logging::info(&format!("preview: ANativeWindow_setDequeueTimeout(50ms) ret={}", ret));
+            }
+        }
+
         logging::info("preview: surface bridge successfully established via libbufferqueueconverter");
 
         Some(SurfaceBridge {
@@ -629,6 +640,7 @@ impl SurfaceBridge {
             fn_destroy: Some(fn_destroy),
             frames: 0,
             fail_count: 0,
+            last_post: std::time::Instant::now() - std::time::Duration::from_millis(50),
         })
     }
 
@@ -636,6 +648,11 @@ impl SurfaceBridge {
         if width <= 0 || height <= 0 || self.native_window.is_null() {
             return -1;
         }
+
+        if self.last_post.elapsed() < std::time::Duration::from_millis(28) {
+            return 0;
+        }
+
         let mut buffer = ANativeWindow_Buffer {
             width: 0,
             height: 0,
@@ -646,6 +663,9 @@ impl SurfaceBridge {
         };
         let locked = unsafe { ANativeWindow_lock(self.native_window, &mut buffer, ptr::null_mut()) };
         if locked != 0 || buffer.bits.is_null() {
+            if locked == -38 {
+                unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+            }
             let fails = self.fail_count;
             self.fail_count += 1;
             if fails < 5 || fails % 30 == 0 {
@@ -656,6 +676,8 @@ impl SurfaceBridge {
             }
             return -3;
         }
+        self.fail_count = 0;
+
         let bw = buffer.width;
         let bh = buffer.height;
         let stride = buffer.stride;
@@ -695,13 +717,14 @@ impl SurfaceBridge {
         let denom_w = (bw - 1).max(1);
         let denom_h = (bh - 1).max(1);
 
-        let mut row_y_offs = Vec::with_capacity(bw as usize);
-        let mut row_uv_offs = Vec::with_capacity(bw as usize);
-        for dx in 0..bw {
-            let px = crop_x0 + (dx * (crop_w - 1)) / denom_w;
+        let bw_usize = (bw as usize).min(1080);
+        let mut row_y_offs = [0usize; 1080];
+        let mut row_uv_offs = [0usize; 1080];
+        for dx in 0..bw_usize {
+            let px = crop_x0 + (dx as i32 * (crop_w - 1)) / denom_w;
             let s_row = px.clamp(0, height - 1) as usize;
-            row_y_offs.push(s_row * width as usize);
-            row_uv_offs.push((s_row >> 1) * width as usize);
+            row_y_offs[dx] = s_row * width as usize;
+            row_uv_offs[dx] = (s_row >> 1) * width as usize;
         }
 
         if buffer.format == 4 {
@@ -712,7 +735,7 @@ impl SurfaceBridge {
                 let sensor_col = ((width - 1) - py).clamp(0, width - 1) as usize;
                 let col_uv_base = (sensor_col >> 1) << 1;
                 let dst_row = unsafe { dst.add(dy as usize * stride as usize) };
-                for dx in 0..bw as usize {
+                for dx in 0..bw_usize {
                     let y_val = y_plane[sensor_col + row_y_offs[dx]];
                     let uv_idx = row_uv_offs[dx] + col_uv_base;
                     let v_val = vu_plane[uv_idx];
@@ -732,7 +755,7 @@ impl SurfaceBridge {
                 let sensor_col = ((width - 1) - py).clamp(0, width - 1) as usize;
                 let col_uv_base = (sensor_col >> 1) << 1;
                 let dst_row = unsafe { dst.add(dy as usize * stride as usize) };
-                for dx in 0..bw as usize {
+                for dx in 0..bw_usize {
                     let y_val = y_plane[sensor_col + row_y_offs[dx]];
                     let uv_idx = row_uv_offs[dx] + col_uv_base;
                     let v_val = vu_plane[uv_idx];
@@ -750,8 +773,9 @@ impl SurfaceBridge {
         if post_res != 0 {
             logging::error(&format!("preview: ANativeWindow_unlockAndPost failed: {}", post_res));
         }
+        self.last_post = std::time::Instant::now();
         self.frames += 1;
-        if self.frames == 1 || self.frames % 5 == 0 {
+        if self.frames == 1 || self.frames % 15 == 0 {
             logging::info(&format!(
                 "preview: rendered frame {} ({}x{}, stride {})",
                 self.frames, bw, bh, stride
