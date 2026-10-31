@@ -244,6 +244,11 @@ fn to_nv21(
 
 pub type FrameFn = Box<dyn FnMut(*const u8, i32, i32, i32) + Send>;
 
+struct CallbackCtx {
+    active: Mutex<bool>,
+    cb: Mutex<Option<FrameFn>>,
+}
+
 pub struct CameraEngine {
     manager: *mut ACameraManager,
     device: *mut ACameraDevice,
@@ -363,13 +368,16 @@ impl CameraEngine {
 
             if !self.image_callback_ctx.is_null() {
                 drop(Arc::from_raw(
-                    self.image_callback_ctx as *const Mutex<Option<FrameFn>>,
+                    self.image_callback_ctx as *const CallbackCtx,
                 ));
                 self.image_callback_ctx = ptr::null_mut();
             }
 
             let cb: FrameFn = Box::new(callback);
-            let ctx = Arc::into_raw(Arc::new(Mutex::new(Some(cb)))) as *mut c_void;
+            let ctx = Arc::into_raw(Arc::new(CallbackCtx {
+                active: Mutex::new(true),
+                cb: Mutex::new(Some(cb)),
+            })) as *mut c_void;
             self.image_callback_ctx = ctx;
             self.reader_listener.context = ctx;
             AImageReader_setImageListener(self.reader, &mut *self.reader_listener);
@@ -435,7 +443,22 @@ impl CameraEngine {
         unsafe { self.teardown_session(); }
     }
 
+    fn deactivate_callback(&mut self) {
+        if !self.image_callback_ctx.is_null() {
+            unsafe {
+                let ctx = &*(self.image_callback_ctx as *const CallbackCtx);
+                if let Ok(mut active) = ctx.active.lock() {
+                    *active = false;
+                }
+                if let Ok(mut cb) = ctx.cb.lock() {
+                    *cb = None;
+                }
+            }
+        }
+    }
+
     unsafe fn teardown_session(&mut self) {
+        self.deactivate_callback();
         if !self.session.is_null() {
             ACameraCaptureSession_close(self.session);
             self.session = ptr::null_mut();
@@ -479,86 +502,77 @@ impl CameraEngine {
     extern "C" fn on_session_active(_context: *mut c_void, _session: *mut ACameraCaptureSession) {}
 
     extern "C" fn on_image_available(context: *mut c_void, reader: *mut AImageReader) {
-        let mut image = ptr::null_mut();
+        if context.is_null() {
+            return;
+        }
         unsafe {
-            let res = AImageReader_acquireNextImage(reader, &mut image);
-            if res != AMEDIA_OK || image.is_null() {
-                return;
-            }
-            let mut width = 0;
-            let mut height = 0;
-            AImage_getWidth(image, &mut width);
-            AImage_getHeight(image, &mut height);
+            let ctx = &*(context as *const CallbackCtx);
+            let (nv21, width, height) = {
+                let active = match ctx.active.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                if !*active {
+                    return;
+                }
+                let mut image = ptr::null_mut();
+                let res = AImageReader_acquireNextImage(reader, &mut image);
+                if res != AMEDIA_OK || image.is_null() {
+                    return;
+                }
+                let mut width = 0;
+                let mut height = 0;
+                AImage_getWidth(image, &mut width);
+                AImage_getHeight(image, &mut height);
 
-            // The algorithm library consumes NV21, not the Y plane. The stock
-            // HAL copies the Y plane and then interleaves the V and U planes
-            // into one buffer (face.default.so, camera_first_frame_callback at
-            // 0x8634-0x86bc), so this does the same.
-            let mut y_data = ptr::null_mut();
-            let mut y_len = 0;
-            AImage_getPlaneData(image, 0, &mut y_data, &mut y_len);
-            let mut u_data = ptr::null_mut();
-            let mut u_len = 0;
-            AImage_getPlaneData(image, 1, &mut u_data, &mut u_len);
-            let mut v_data = ptr::null_mut();
-            let mut v_len = 0;
-            AImage_getPlaneData(image, 2, &mut v_data, &mut v_len);
+                // The algorithm library consumes NV21, not the Y plane. The stock
+                // HAL copies the Y plane and then interleaves the V and U planes
+                // into one buffer (face.default.so, camera_first_frame_callback at
+                // 0x8634-0x86bc), so this does the same.
+                let mut y_data = ptr::null_mut();
+                let mut y_len = 0;
+                AImage_getPlaneData(image, 0, &mut y_data, &mut y_len);
+                let mut u_data = ptr::null_mut();
+                let mut u_len = 0;
+                AImage_getPlaneData(image, 1, &mut u_data, &mut u_len);
+                let mut v_data = ptr::null_mut();
+                let mut v_len = 0;
+                AImage_getPlaneData(image, 2, &mut v_data, &mut v_len);
 
-            let mut y_stride = 0;
-            AImage_getPlaneRowStride(image, 0, &mut y_stride);
-            let mut u_stride = 0;
-            AImage_getPlaneRowStride(image, 1, &mut u_stride);
-            let mut v_stride = 0;
-            AImage_getPlaneRowStride(image, 2, &mut v_stride);
-            let mut y_pixel = 0;
-            AImage_getPlanePixelStride(image, 0, &mut y_pixel);
-            let mut u_pixel = 0;
-            AImage_getPlanePixelStride(image, 1, &mut u_pixel);
-            let mut v_pixel = 0;
-            AImage_getPlanePixelStride(image, 2, &mut v_pixel);
+                let mut y_stride = 0;
+                AImage_getPlaneRowStride(image, 0, &mut y_stride);
+                let mut u_pixel = 0;
+                AImage_getPlanePixelStride(image, 1, &mut u_pixel);
 
-            logging::info(&format!(
-                "camera: frame {}x{} y_stride={} y_pixel={} u_stride={} u_pixel={} v_stride={} v_pixel={} lens={} lens_len={} ulen={} vlen={} u={:p} v={:p}",
-                width,
-                height,
-                y_stride,
-                y_pixel,
-                u_stride,
-                u_pixel,
-                v_stride,
-                v_pixel,
-                y_len,
-                y_len,
-                u_len,
-                v_len,
-                u_data,
-                v_data
-            ));
-            if !context.is_null() && !y_data.is_null() && !u_data.is_null() && !v_data.is_null() {
-                let nv21 = to_nv21(
-                    y_data,
-                    y_stride,
-                    y_len as usize,
-                    u_data,
-                    u_pixel,
-                    u_len as usize,
-                    v_data,
-                    width,
-                    height,
-                );
-                if let Some(nv21) = nv21 {
-                    dump_frame(&nv21);
-                    let m = &*(context as *const Mutex<Option<FrameFn>>);
-                    if let Ok(mut lock) = m.try_lock() {
-                        if let Some(cb) = lock.as_mut() {
-                            // The NV21 buffer is tightly packed, so its row
-                            // stride is the width.
-                            cb(nv21.as_ptr(), width, height, width);
-                        }
+                let nv21 = if !y_data.is_null() && !u_data.is_null() && !v_data.is_null() {
+                    to_nv21(
+                        y_data,
+                        y_stride,
+                        y_len as usize,
+                        u_data,
+                        u_pixel,
+                        u_len as usize,
+                        v_data,
+                        width,
+                        height,
+                    )
+                } else {
+                    None
+                };
+                AImage_delete(image);
+                (nv21, width, height)
+            };
+
+            if let Some(nv21) = nv21 {
+                dump_frame(&nv21);
+                if let Ok(mut lock) = ctx.cb.try_lock() {
+                    if let Some(cb) = lock.as_mut() {
+                        // The NV21 buffer is tightly packed, so its row
+                        // stride is the width.
+                        cb(nv21.as_ptr(), width, height, width);
                     }
                 }
             }
-            AImage_delete(image);
         }
     }
 }
@@ -567,6 +581,7 @@ impl Drop for CameraEngine {
     fn drop(&mut self) {
         unsafe {
             logging::info("camera: dropping engine");
+            self.deactivate_callback();
             self.teardown_session();
             if !self.device.is_null() {
                 ACameraDevice_close(self.device);
@@ -586,8 +601,7 @@ impl Drop for CameraEngine {
                 self.manager = ptr::null_mut();
             }
             if !self.image_callback_ctx.is_null() {
-                let arc = Arc::from_raw(self.image_callback_ctx as *const Mutex<Option<FrameFn>>);
-                *arc.lock().unwrap() = None;
+                drop(Arc::from_raw(self.image_callback_ctx as *const CallbackCtx));
                 self.image_callback_ctx = ptr::null_mut();
             }
         }

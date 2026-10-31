@@ -567,6 +567,10 @@ impl StFace {
     /// a negative error (face.default.so 0x8248-0x8290).
     pub fn unlock(&self, data: &[u8], width: c_int, height: c_int, stride: c_int) -> Result<(), c_int> {
         let _guard = ALGO_LOCK.lock().unwrap();
+        // Stock face.default.so calls st_auth_reset() at 0xb8f0 before each verify call.
+        unsafe {
+            st_auth_reset();
+        }
         let img = StImage::new(data.as_ptr() as *mut u8, width, height, stride);
         let has_ocular = std::path::Path::new("/data/vendor_de/0/facedata/feature_ocular.txt").exists()
             || std::path::Path::new("/data/vendor_de/0/facedata/feature_ocular.data").exists();

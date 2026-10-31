@@ -6,9 +6,10 @@
 // per-frame st_auth_enroll / st_auth_unlock -> terminal callback).
 #![allow(non_snake_case, dead_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use rsbinder::{Interface, Strong};
 
@@ -54,6 +55,33 @@ pub fn algo() -> Option<Arc<Mutex<StFace>>> {
 /// Only one camera exists and only one operation may run at a time, so the
 /// engine is process-global rather than per-session.
 static GLOBAL_CAMERA: Mutex<Option<CameraEngine>> = Mutex::new(None);
+
+/// Serializes camera open -> capture loop -> close across session worker threads.
+static SESSION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Tracks the active operation's cancellation flag and wakeup condvar so starting
+/// a new operation or closing the session immediately wakes and stops the prior one.
+static ACTIVE_OP: Mutex<Option<(Arc<AtomicBool>, Arc<Condvar>)>> = Mutex::new(None);
+
+fn cancel_active_operation() {
+    let mut guard = ACTIVE_OP.lock().unwrap();
+    if let Some((ref cancel, ref notify)) = *guard {
+        cancel.store(true, Ordering::SeqCst);
+        notify.notify_all();
+    }
+    *guard = None;
+}
+
+fn register_active_operation(cancel: &Arc<AtomicBool>, notify: &Arc<Condvar>) {
+    let mut guard = ACTIVE_OP.lock().unwrap();
+    if let Some((ref prev_cancel, ref prev_notify)) = *guard {
+        prev_cancel.store(true, Ordering::SeqCst);
+        prev_notify.notify_all();
+    }
+    *guard = Some((cancel.clone(), notify.clone()));
+}
+
+type FrameData = (Vec<u8>, i32, i32, i32);
 
 /// Number of good frames a full enrollment needs. The stock HAL keeps this in
 /// default_face_hal::mMaxEnrollCount; its literal value was not recovered, so it
@@ -115,6 +143,7 @@ fn token_from_handle(handle: &NativeHandle) -> Vec<u8> {
 pub struct CancellationSignal {
     pub is_cancelled: Arc<AtomicBool>,
     pub is_completed: Arc<AtomicBool>,
+    pub notify: Arc<Condvar>,
     pub callback: Option<Strong<dyn ISessionCallback>>,
 }
 
@@ -124,10 +153,7 @@ impl ICancellationSignal for CancellationSignal {
     fn cancel(&self) -> rsbinder::status::Result<()> {
         if !self.is_cancelled.swap(true, Ordering::SeqCst) {
             logging::info("session: operation cancelled");
-            thread::spawn(|| {
-                close_camera();
-                surface_bridge::clear();
-            });
+            self.notify.notify_all();
             if !self.is_completed.load(Ordering::SeqCst) {
                 if let Some(ref cb) = self.callback {
                     let _ = cb.onError(FaceError::CANCELED, 0);
@@ -205,52 +231,58 @@ impl ISession for FaceSession {
                 return Ok(BnCancellationSignal::new_binder(CancellationSignal {
                     is_cancelled: Arc::new(AtomicBool::new(true)),
                     is_completed: Arc::new(AtomicBool::new(false)),
+                    notify: Arc::new(Condvar::new()),
                     callback: None,
                 }));
             }
         };
 
-        // The stock HAL prepares the algorithm before scanning: image count per
-        // face id, reset, drop stale faces and install the search ROI.
-        {
-            let guard = algo.lock().unwrap();
-            if let Err(e) = guard.prepare_enroll() {
-                logging::error(&format!("session: enrollment setup failed ret={}", e));
-                self.err(FaceError::UNABLE_TO_PROCESS, 0);
-                return Ok(BnCancellationSignal::new_binder(CancellationSignal {
-                    is_cancelled: Arc::new(AtomicBool::new(true)),
-                    is_completed: Arc::new(AtomicBool::new(false)),
-                    callback: None,
-                }));
-            }
-        }
-
-        // The preview surface arrives as a HAL token in the NativeHandle's ints
-        // (the framework packs it there; see FaceService.acquireSurfaceHandle).
-        // Turn it into a window the camera frames can be drawn into.
-        if let Some(handle) = _preview_surface {
-            let token = token_from_handle(handle);
-            match surface_bridge::SurfaceBridge::create(&token) {
-                Some(bridge) => {
-                    logging::info("session: preview surface attached");
-                    surface_bridge::install(bridge);
-                }
-                None => logging::error("session: could not decode the preview surface token"),
-            }
-        }
-
+        let preview_token = _preview_surface.map(token_from_handle);
         let cb = self.callback.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Condvar::new());
+        register_active_operation(&cancelled, &notify);
+
         let cancel_flag = cancelled.clone();
         let complete_flag = completed.clone();
+        let notify_worker = notify.clone();
         let total = enroll_frames();
 
         thread::spawn(move || {
+            let _session_guard = SESSION_LOCK.lock().unwrap();
+            if cancel_flag.load(Ordering::SeqCst) {
+                return;
+            }
+
             close_camera();
+            surface_bridge::clear();
+
+            {
+                let guard = algo.lock().unwrap();
+                if let Err(e) = guard.prepare_enroll() {
+                    logging::error(&format!("session: enrollment setup failed ret={}", e));
+                    let _ = cb.onError(FaceError::UNABLE_TO_PROCESS, 0);
+                    return;
+                }
+                let r = guard.set_faceid_image_number(total);
+                logging::info(&format!("session: enroll set_faceid_image_number({}) ret={}", total, r));
+            }
+
+            if let Some(ref token) = preview_token {
+                match surface_bridge::SurfaceBridge::create(token) {
+                    Some(bridge) => {
+                        logging::info("session: preview surface attached");
+                        surface_bridge::install(bridge);
+                    }
+                    None => logging::error("session: could not decode the preview surface token"),
+                }
+            }
+
             let mut cam = CameraEngine::new();
             if !cam.open(&camera_id()) {
                 logging::error("session: enroll could not open camera");
+                surface_bridge::clear();
                 let _ = cb.onError(FaceError::UNABLE_TO_PROCESS, 0);
                 return;
             }
@@ -259,96 +291,28 @@ impl ISession for FaceSession {
                 *lock = Some(cam);
             }
 
-            let enrolled = Arc::new(AtomicI32::new(0));
-            let e2 = enrolled.clone();
-            let c2 = cancel_flag.clone();
-            let comp2 = complete_flag.clone();
-            let a2 = algo.clone();
-            let cb2 = cb.clone();
-            let last_sample_time = Arc::new(Mutex::new(std::time::Instant::now()));
-            let lst = last_sample_time.clone();
-            let enroll_id = Arc::new(AtomicI32::new(1));
-            let eid = enroll_id.clone();
-
-            {
-                let guard = a2.lock().unwrap();
-                let r = guard.set_faceid_image_number(total);
-                logging::info(&format!("session: enroll set_faceid_image_number({}) ret={}", total, r));
-            }
+            let latest_frame: Arc<Mutex<Option<FrameData>>> = Arc::new(Mutex::new(None));
+            let lf_cb = latest_frame.clone();
+            let c_cb = cancel_flag.clone();
+            let n_cb = notify_worker.clone();
 
             let started = {
                 let mut lock = GLOBAL_CAMERA.lock().unwrap();
                 match lock.as_mut() {
                     Some(c) => c.start_capture(CAPTURE_WIDTH, CAPTURE_HEIGHT, move |data, w, h, stride| {
-                        if c2.load(Ordering::SeqCst) {
+                        if c_cb.load(Ordering::SeqCst) {
                             return;
                         }
-
-                        // The algorithm library consumes NV21: the Y plane
-                        // followed by the interleaved V and U planes.
                         let frame = unsafe {
                             std::slice::from_raw_parts(data, (w * h * 3 / 2) as usize)
                         };
-
-                        // Draw the frame into the preview surface on every single camera frame.
+                        // Render every camera frame immediately without blocking on algorithm calls.
                         surface_bridge::render_current(frame, w, h);
 
-                        if e2.load(Ordering::SeqCst) >= total {
-                            return;
+                        if let Ok(mut slot) = lf_cb.lock() {
+                            *slot = Some((frame.to_vec(), w, h, stride));
                         }
-
-                        // Pace enrollment samples so the UI circle and camera preview have time to show.
-                        {
-                            let mut t_lock = lst.lock().unwrap();
-                            if t_lock.elapsed().as_millis() < 600 {
-                                return;
-                            }
-                            *t_lock = std::time::Instant::now();
-                        }
-
-                        let guard = a2.lock().unwrap();
-                        // st_auth_enroll returns the number of images it still
-                        // needs; 0 means the enrollment finished and the
-                        // returned value is the new face id.
-                        match guard.enroll(frame, w, h, stride) {
-                            Ok(EnrollOutcome::Accepted) => {
-                                let n = e2.fetch_add(1, Ordering::SeqCst) + 1;
-                                let remaining = (total - n).max(0);
-                                logging::info(&format!(
-                                    "session: enroll sample {}/{} accepted (remaining={})",
-                                    n, total, remaining
-                                ));
-                                let cur_id = eid.load(Ordering::SeqCst);
-                                let _ = cb2.onEnrollmentProgress(cur_id, remaining);
-                            }
-                            Ok(EnrollOutcome::Complete(face_id)) => {
-                                let final_id = if face_id > 0 { face_id } else { 1 };
-                                eid.store(final_id, Ordering::SeqCst);
-                                e2.store(total, Ordering::SeqCst);
-                                comp2.store(true, Ordering::SeqCst);
-                                logging::info(&format!(
-                                    "session: enrollment complete after {} samples, face_id={}",
-                                    total, final_id
-                                ));
-                                let _ = cb2.onEnrollmentProgress(final_id, 0);
-
-                                // Safety timeout: if framework does not close the session within 10s, release camera.
-                                let c3 = c2.clone();
-                                thread::spawn(move || {
-                                    thread::sleep(std::time::Duration::from_secs(10));
-                                    if !c3.swap(true, Ordering::SeqCst) {
-                                        logging::info("session: enroll safety timeout closing camera");
-                                        close_camera();
-                                        surface_bridge::clear();
-                                    }
-                                });
-                            }
-                            Err(r) => {
-                                if r != 1 {
-                                    logging::info(&format!("session: st_auth_enroll ret={}", r));
-                                }
-                            }
-                        }
+                        n_cb.notify_all();
                     }),
                     None => false,
                 }
@@ -356,13 +320,109 @@ impl ISession for FaceSession {
 
             if !started {
                 logging::error("session: enroll capture did not start");
+                close_camera();
+                surface_bridge::clear();
                 let _ = cb.onError(FaceError::UNABLE_TO_PROCESS, 0);
+                return;
             }
+
+            let start_time = Instant::now();
+            let mut next_sample_at = start_time + Duration::from_millis(700);
+            let mut enrolled_count = 0i32;
+
+            loop {
+                if cancel_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                if start_time.elapsed() > Duration::from_secs(30) {
+                    logging::info("session: enroll timed out after 30s");
+                    if !cancel_flag.swap(true, Ordering::SeqCst) {
+                        let _ = cb.onError(FaceError::TIMEOUT, 0);
+                    }
+                    break;
+                }
+
+                let now = Instant::now();
+                if now < next_sample_at {
+                    let wait_dur = (next_sample_at - now).min(Duration::from_millis(100));
+                    let slot = latest_frame.lock().unwrap();
+                    let _ = notify_worker.wait_timeout(slot, wait_dur).unwrap();
+                    continue;
+                }
+
+                let maybe_frame = {
+                    let mut slot = latest_frame.lock().unwrap();
+                    if slot.is_none() {
+                        let (mut slot, _) = notify_worker
+                            .wait_timeout(slot, Duration::from_millis(100))
+                            .unwrap();
+                        slot.take()
+                    } else {
+                        slot.take()
+                    }
+                };
+
+                let (frame_bytes, w, h, stride) = match maybe_frame {
+                    Some(f) => f,
+                    None => continue,
+                };
+
+                if cancel_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let outcome = {
+                    let guard = algo.lock().unwrap();
+                    guard.enroll(&frame_bytes, w, h, stride)
+                };
+
+                match outcome {
+                    Ok(EnrollOutcome::Accepted) => {
+                        enrolled_count += 1;
+                        let remaining = (total - enrolled_count).max(1);
+                        logging::info(&format!(
+                            "session: enroll sample {}/{} accepted (remaining={})",
+                            enrolled_count, total, remaining
+                        ));
+                        let _ = cb.onEnrollmentProgress(1, remaining);
+                        // Sample 1 triggers FaceEnrollNewActivity.onEnrollProgressStart (600ms delay + 450ms fade-in + 560ms 0->20% ring).
+                        let delay_ms = if enrolled_count == 1 { 1600 } else { 650 };
+                        next_sample_at = Instant::now() + Duration::from_millis(delay_ms);
+                    }
+                    Ok(EnrollOutcome::Complete(face_id)) => {
+                        let final_id = if face_id > 0 { face_id } else { 1 };
+                        enrolled_count = total;
+                        complete_flag.store(true, Ordering::SeqCst);
+                        logging::info(&format!(
+                            "session: enrollment complete after {} samples, face_id={}",
+                             enrolled_count, final_id
+                        ));
+                        let _ = cb.onEnrollmentProgress(final_id, 0);
+                        // Allow the final 80%->100% UI ring transition (560ms) to finish before teardown.
+                        let slot = latest_frame.lock().unwrap();
+                        let _ = notify_worker
+                            .wait_timeout(slot, Duration::from_millis(600))
+                            .unwrap();
+                        break;
+                    }
+                    Err(r) => {
+                        if r != 1 {
+                            logging::info(&format!("session: st_auth_enroll ret={}", r));
+                        }
+                        next_sample_at = Instant::now() + Duration::from_millis(80);
+                    }
+                }
+            }
+
+            cancel_flag.store(true, Ordering::SeqCst);
+            close_camera();
+            surface_bridge::clear();
         });
 
         Ok(BnCancellationSignal::new_binder(CancellationSignal {
             is_cancelled: cancelled,
             is_completed: completed,
+            notify,
             callback: Some(self.callback.clone()),
         }))
     }
@@ -376,27 +436,38 @@ impl ISession for FaceSession {
                 return Ok(BnCancellationSignal::new_binder(CancellationSignal {
                     is_cancelled: Arc::new(AtomicBool::new(true)),
                     is_completed: Arc::new(AtomicBool::new(false)),
+                    notify: Arc::new(Condvar::new()),
                     callback: None,
                 }));
             }
         };
 
-        // Reset algorithm ROI to full frame (matching stock face_authenticate at 0xa574).
-        {
-            let guard = algo.lock().unwrap();
-            let r = guard.clear_roi();
-            logging::info(&format!("session: authenticate cleared roi ret={}", r));
-        }
-
         let cb = self.callback.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Condvar::new());
+        register_active_operation(&cancelled, &notify);
+
         let cancel_flag = cancelled.clone();
         let done_flag = done.clone();
+        let notify_worker = notify.clone();
         let user_id = self.user_id as i64;
 
         thread::spawn(move || {
+            let _session_guard = SESSION_LOCK.lock().unwrap();
+            if cancel_flag.load(Ordering::SeqCst) {
+                return;
+            }
+
             close_camera();
+
+            // Reset algorithm ROI to full frame (matching stock face_authenticate at 0xa574).
+            {
+                let guard = algo.lock().unwrap();
+                let r = guard.clear_roi();
+                logging::info(&format!("session: authenticate cleared roi ret={}", r));
+            }
+
             let mut cam = CameraEngine::new();
             if !cam.open(&camera_id()) {
                 logging::error("session: authenticate could not open camera");
@@ -408,69 +479,25 @@ impl ISession for FaceSession {
                 *lock = Some(cam);
             }
 
-            let d2 = done_flag.clone();
-            let c2 = cancel_flag.clone();
-            let a2 = algo.clone();
-            let cb2 = cb.clone();
-            let start_time = std::time::Instant::now();
-            let frame_counter = Arc::new(AtomicI32::new(0));
-            let fc = frame_counter.clone();
+            let latest_frame: Arc<Mutex<Option<FrameData>>> = Arc::new(Mutex::new(None));
+            let lf_cb = latest_frame.clone();
+            let c_cb = cancel_flag.clone();
+            let n_cb = notify_worker.clone();
 
             let started = {
                 let mut lock = GLOBAL_CAMERA.lock().unwrap();
                 match lock.as_mut() {
                     Some(c) => c.start_capture(CAPTURE_WIDTH, CAPTURE_HEIGHT, move |data, w, h, stride| {
-                        if c2.load(Ordering::SeqCst) || d2.load(Ordering::SeqCst) {
+                        if c_cb.load(Ordering::SeqCst) {
                             return;
                         }
-                        if start_time.elapsed().as_secs() > 8 {
-                            d2.store(true, Ordering::SeqCst);
-                            c2.store(true, Ordering::SeqCst);
-                            logging::info("session: authenticate timed out after 8s");
-                            let _ = cb2.onError(FaceError::TIMEOUT, 0);
-                            thread::spawn(|| {
-                                close_camera();
-                            });
-                            return;
-                        }
-
                         let frame = unsafe {
                             std::slice::from_raw_parts(data, (w * h * 3 / 2) as usize)
                         };
-                        let guard = a2.lock().unwrap();
-                        match guard.unlock(frame, w, h, stride) {
-                            Ok(()) => {
-                                d2.store(true, Ordering::SeqCst);
-                                c2.store(true, Ordering::SeqCst);
-                                let fid = guard.get_face_id();
-                                let face_id = if fid > 0 { fid } else { 1 };
-                                logging::info(&format!("session: authentication succeeded for face_id={}", face_id));
-                                let now_ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis() as i64;
-                                let hat = HardwareAuthToken {
-                                    challenge: operation_id,
-                                    userId: user_id,
-                                    authenticatorId: face_id as i64,
-                                    authenticatorType: crate::bindings::android::hardware::keymaster::HardwareAuthenticatorType::HardwareAuthenticatorType(8),
-                                    timestamp: crate::bindings::android::hardware::keymaster::Timestamp::Timestamp {
-                                        milliSeconds: now_ms,
-                                    },
-                                    mac: vec![0u8; 32],
-                                };
-                                let _ = cb2.onAuthenticationSucceeded(face_id, &hat);
-                                thread::spawn(|| {
-                                    close_camera();
-                                });
-                            }
-                            Err(r) => {
-                                let count = fc.fetch_add(1, Ordering::SeqCst);
-                                if r != 1 || count % 15 == 0 {
-                                    logging::info(&format!("session: st_auth_unlock ret={} (frame {})", r, count));
-                                }
-                            }
+                        if let Ok(mut slot) = lf_cb.lock() {
+                            *slot = Some((frame.to_vec(), w, h, stride));
                         }
+                        n_cb.notify_all();
                     }),
                     None => false,
                 }
@@ -478,13 +505,101 @@ impl ISession for FaceSession {
 
             if !started {
                 logging::error("session: authenticate capture did not start");
+                close_camera();
                 let _ = cb.onError(FaceError::UNABLE_TO_PROCESS, 0);
+                return;
             }
+
+            let start_time = Instant::now();
+            let mut frame_counter = 0i32;
+
+            loop {
+                if cancel_flag.load(Ordering::SeqCst) || done_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                if start_time.elapsed() > Duration::from_secs(8) {
+                    done_flag.store(true, Ordering::SeqCst);
+                    if !cancel_flag.swap(true, Ordering::SeqCst) {
+                        logging::info("session: authenticate timed out after 8s");
+                        let _ = cb.onError(FaceError::TIMEOUT, 0);
+                    }
+                    break;
+                }
+
+                let maybe_frame = {
+                    let mut slot = latest_frame.lock().unwrap();
+                    if slot.is_none() {
+                        let (mut slot, _) = notify_worker
+                            .wait_timeout(slot, Duration::from_millis(100))
+                            .unwrap();
+                        slot.take()
+                    } else {
+                        slot.take()
+                    }
+                };
+
+                let (frame_bytes, w, h, stride) = match maybe_frame {
+                    Some(f) => f,
+                    None => continue,
+                };
+
+                if cancel_flag.load(Ordering::SeqCst) || done_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let result = {
+                    let guard = algo.lock().unwrap();
+                    match guard.unlock(&frame_bytes, w, h, stride) {
+                        Ok(()) => {
+                            let fid = guard.get_face_id();
+                            Ok(if fid > 0 { fid } else { 1 })
+                        }
+                        Err(r) => Err(r),
+                    }
+                };
+
+                match result {
+                    Ok(face_id) => {
+                        done_flag.store(true, Ordering::SeqCst);
+                        cancel_flag.store(true, Ordering::SeqCst);
+                        logging::info(&format!("session: authentication succeeded for face_id={}", face_id));
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+                        let hat = HardwareAuthToken {
+                            challenge: operation_id,
+                            userId: user_id,
+                            authenticatorId: face_id as i64,
+                            authenticatorType: crate::bindings::android::hardware::keymaster::HardwareAuthenticatorType::HardwareAuthenticatorType(8),
+                            timestamp: crate::bindings::android::hardware::keymaster::Timestamp::Timestamp {
+                                milliSeconds: now_ms,
+                            },
+                            mac: vec![0u8; 32],
+                        };
+                        let _ = cb.onAuthenticationSucceeded(face_id, &hat);
+                        break;
+                    }
+                    Err(r) => {
+                        frame_counter += 1;
+                        if r != 1 || frame_counter % 15 == 0 {
+                            logging::info(&format!(
+                                "session: st_auth_unlock ret={} (frame {})",
+                                r, frame_counter
+                            ));
+                        }
+                    }
+                }
+            }
+
+            cancel_flag.store(true, Ordering::SeqCst);
+            close_camera();
         });
 
         Ok(BnCancellationSignal::new_binder(CancellationSignal {
             is_cancelled: cancelled,
             is_completed: done,
+            notify,
             callback: Some(self.callback.clone()),
         }))
     }
@@ -495,6 +610,7 @@ impl ISession for FaceSession {
         Ok(BnCancellationSignal::new_binder(CancellationSignal {
             is_cancelled: Arc::new(AtomicBool::new(true)),
             is_completed: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Condvar::new()),
             callback: None,
         }))
     }
@@ -565,8 +681,11 @@ impl ISession for FaceSession {
 
     fn close(&self) -> rsbinder::status::Result<()> {
         logging::info("session: close");
+        cancel_active_operation();
+        let _session_guard = SESSION_LOCK.lock().unwrap();
         close_camera();
         surface_bridge::clear();
+        drop(_session_guard);
         self.callback.onSessionClosed()?;
         Ok(())
     }
