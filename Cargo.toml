@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["ryanistr"]
 license = "Apache-2.0"
 description = "AIDL face HAL (android.hardware.biometrics.face.IFace) for Android, driving the front camera and the SenseTime face algorithm"
-repository = "https://github.com/ryanistr/vendor-sensetime-face-aidl"
+repository = "https://github.com/ryanistr/vendor-senseface-aidl"
 
 # The staged filename is android.hardware.biometrics.face-service, but a Rust
 # crate/bin name cannot contain '.', so the crate builds as face-hal-service and
