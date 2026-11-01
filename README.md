@@ -165,6 +165,10 @@ The algorithm library `libstfaceunlockppl.so` is not in this repository. The HAL
 from the phone's vendor partition at runtime, and its license is in
 `vendor/media/license.lic` in the ROM tree.
 
+`re/disasm/` holds disassembly of the vendor's own HIDL module, `face.default.so`, taken
+from the ROM's vendor partition. It is analysis material for the API recovery, not
+source, and it is not covered by this repository's Apache-2.0 grant.
+
 Enrolling a face stores biometric data in the phone's protected storage. The HAL reports
 itself as CONVENIENCE strength, not STRONG, because it has no TEE-backed storage for
 templates and hands the framework no hardware auth token.
