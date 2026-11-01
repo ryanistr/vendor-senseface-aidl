@@ -92,8 +92,10 @@ fn main() {
     std::fs::write(&out_file, content).unwrap();
 
     // ---- link search paths (ROM-provided libraries only) ----
-    let root = env::var("ROM_TREE")
-        .unwrap_or_else(|_| "/mnt/project/RomTools/ROM_WORKDIR/oos/erofs".to_string());
+    // ROM_TREE points at the unpacked ROM this HAL is ported into. The default
+    // is the sibling tree of this checkout, the same one scripts/build.sh
+    // assumes.
+    let root = env::var("ROM_TREE").unwrap_or_else(|_| "../../erofs".to_string());
     let vendor64 = format!("{}/vendor/lib64", root);
     let system64 = format!("{}/system/system/lib64", root);
 

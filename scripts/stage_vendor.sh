@@ -1,9 +1,12 @@
 #!/bin/bash
 # FaceHAL/scripts/stage_vendor.sh
 #
-# Installs the AIDL face HAL into the unpacked vendor tree of the oos project so
-# the next repack ships it. This ONLY writes files into erofs/vendor — it never
-# repacks an image and never touches the device.
+# Installs the AIDL face HAL into an unpacked vendor tree so the next repack
+# ships it. This ONLY writes files into <tree>/vendor — it never repacks an
+# image and never touches the device.
+#
+# The tree is the unpacked ROM the HAL is being ported into. Point ROM_TREE at
+# it; it defaults to the sibling erofs/ directory of this checkout.
 #
 # Naming is dictated by the vendor's own sepolicy, which already contains
 #   /(vendor|system/vendor)/bin/hw/android\.hardware\.biometrics\.face-service\.example
@@ -134,8 +137,5 @@ echo -e "${GRN}staged and verified${NC}"
 echo "  registers        : $FQNAME"
 echo "  manifest         : android.hardware.biometrics.face AIDL v3"
 echo
-echo "Nothing was repacked or flashed. Repack vendor when you are ready:"
-echo "  cd /mnt/project/RomTools && source tool/functions && \\"
-echo "    export erofsdir=/mnt/project/RomTools/ROM_WORKDIR/oos/erofs && \\"
-echo "    export DIROUT=/mnt/project/RomTools/output && \\"
-echo "    export usable_threads=\$(nproc) && repack_erofs_cmd vendor lz4hc 0"
+echo "Nothing was repacked or flashed. Repack the vendor partition with your"
+echo "own tooling, then flash it."
