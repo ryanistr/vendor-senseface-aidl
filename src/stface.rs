@@ -4,7 +4,7 @@
 // that the stock X6739 HIDL face HAL (erofs/vendor/lib64/hw/face.default.so)
 // loads by dlopen. Every signature below was recovered from that HAL's call
 // sites and cross-checked against the callee's own prologue; see
-// re/notes/st_auth-api.md for the derivation and the residual uncertainty.
+// re/notes/face-hal-re.md for the derivation and the residual uncertainty.
 //
 // This is the same library the stock stack uses, so the AIDL HAL produces the
 // same match results as the HIDL HAL it replaces.
@@ -218,7 +218,7 @@ impl StImage {
     }
 }
 
-/// Values the stock HAL passes; see re/notes/st_auth-api.md.
+/// Values the stock HAL passes; see re/notes/face-hal-re.md.
 pub const LICENSE_PATH: &[u8] = b"/vendor/media/license.lic\0";
 /// Camera id source, read at runtime by the stock HAL.
 pub const CAMERA_CHOOSE_PATH: &str = "/data/vendor_de/0/facedata/cameraChoose.txt";

@@ -88,6 +88,15 @@ if one does not.
 
 `target/` is build output and is not tracked by git.
 
+The build also produces `face-selftest`, which exercises the algorithm binding on its own,
+without a camera. It takes a directory of NV21 frames and runs them through the enroll
+path:
+
+```bash
+adb push target/aarch64-linux-android/release/face-selftest /data/local/tmp/facework/
+adb shell su -c 'su system -c "/data/local/tmp/facework/face-selftest /data/local/tmp/frames"'
+```
+
 ## Use
 
 ### Stage into the ROM tree
@@ -135,7 +144,8 @@ SenseTime wrote the face algorithm, `libstfaceunlockppl.so`, and its license fil
 matching, which is why the results match the stock behaviour.
 
 The AOSP framework provided the AIDL face interface and the `IFace`/`ISession` contract.
-The `.aidl` sources and their frozen snapshots are in `aidl/`.
+The `.aidl` sources are in `aidl/android/`, and the frozen V3 snapshot they were cut from is
+in `aidl/aidl_api/`.
 
 rsbinder, by hiking90, provides Binder IPC and AIDL code generation in Rust.
 
@@ -143,11 +153,8 @@ MediaTek provided the camera NDK library `libcamera2ndk_vendor.so` in the vendor
 
 The AOSP framework's `libgui` provided `Surface`, `BufferQueue` and the bufferqueue
 converter. The HAL reaches the preview surface through `libbufferqueueconverter.so` and
-patches it at runtime for the Android 15 vtable layout. The disassembly that made this
-possible is in `re/`.
-
-The `libgui_sys.so` and `bqc.so` files in this directory are copies of the device's own
-libraries, kept as the input for that disassembly.
+patches it at runtime for the Android 15 vtable layout. The notes in `re/` record what
+that patching has to match.
 
 ## Legal
 
@@ -156,18 +163,13 @@ This repository's own source, meaning `src/`, `scripts/`, `build.rs`, `Cargo.tom
 
 `aidl/` contains AOSP interface definitions, also Apache-2.0.
 
-`libgui_sys.so` and `bqc.so` are copies of binaries from the phone's own system and vendor
-partitions. They are not part of this project's source, they are there so the disassembly
-in `re/` can be reproduced. They carry whatever license their original vendor shipped them
-under.
-
 The algorithm library `libstfaceunlockppl.so` is not in this repository. The HAL loads it
 from the phone's vendor partition at runtime, and its license is in
 `vendor/media/license.lic` in the ROM tree.
 
-`re/disasm/` holds disassembly of the vendor's own HIDL module, `face.default.so`, taken
-from the ROM's vendor partition. It is analysis material for the API recovery, not
-source, and it is not covered by this repository's Apache-2.0 grant.
+`re/notes/` holds the recovered API contract for the vendor's own HIDL module,
+`face.default.so`, taken from the ROM's vendor partition. It is analysis material for the
+API recovery, not source, and it is not covered by this repository's Apache-2.0 grant.
 
 Enrolling a face stores biometric data in the phone's protected storage. The HAL reports
 itself as CONVENIENCE strength, not STRONG, because it has no TEE-backed storage for

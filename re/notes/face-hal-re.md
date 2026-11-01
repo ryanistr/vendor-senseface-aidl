@@ -530,9 +530,8 @@ The HAL's preview path does `ANativeWindow_lock` -> write pixels ->
 `ANativeWindow_unlockAndPost` on an `ANativeWindow` obtained from a
 `GraphicBufferProducer` token, i.e. the HAL is the **producer**.
 
-In the device's `/system/lib64/libgui.so` (host copy
-`RE/faceinv/libgui_sys.so`), `android::Surface::lock(ANativeWindow_Buffer*, ARect*)`
-is at **0xbdd40**. Its failure paths:
+In the device's `/system/lib64/libgui.so`, `android::Surface::lock(ANativeWindow_Buffer*,
+ARect*)` is at **0xbdd40**. Its failure paths:
 
 - **0xbe224** — logs `"Surface::lock failed, already locked"` (string @0x5cdde) and
   returns **-38** (`mov w22, #-0x26`). This is the *"a buffer from a previous frame is
@@ -572,7 +571,7 @@ producer's blocking `dequeueBuffer`. The producer idiom is `Surface::dequeueBuff
 
 ## 19. `acquireSurfaceHandle` is not an exported symbol
 
-`nm -D RE/faceinv/libandroid_servers.so` lists 644 dynamic symbols and **no**
+`nm -D` on the device's `libandroid_servers.so` lists 644 dynamic symbols and **no**
 `acquireSurfaceHandle`. The strings are present, so the native method is
 registered by name (JNI `RegisterNatives`). It is declared
 `public static native NativeHandle acquireSurfaceHandle(Surface surface)` at
