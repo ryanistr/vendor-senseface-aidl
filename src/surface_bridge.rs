@@ -197,6 +197,7 @@ pub struct SurfaceBridge {
     fn_destroy: Option<FnDestroySurfaceHolder>,
     frames: u64,
     fail_count: u64,
+    holds_lock: bool,
     last_post: std::time::Instant,
 }
 
@@ -640,6 +641,7 @@ impl SurfaceBridge {
             fn_destroy: Some(fn_destroy),
             frames: 0,
             fail_count: 0,
+            holds_lock: false,
             last_post: std::time::Instant::now() - std::time::Duration::from_millis(50),
         })
     }
@@ -661,28 +663,42 @@ impl SurfaceBridge {
             bits: ptr::null_mut(),
             reserved: [0; 6],
         };
+        let t_lock = std::time::Instant::now();
         let locked = unsafe { ANativeWindow_lock(self.native_window, &mut buffer, ptr::null_mut()) };
+        let lock_ms = t_lock.elapsed().as_millis();
         if locked != 0 || buffer.bits.is_null() {
-            if locked == -38 {
-                unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+            // -38 (INVALID_OPERATION) means one of two very different things, and the
+            // recovery differs: libgui's "already locked" means Surface::lock saw a
+            // stale mLockedBuffer, while BufferQueueProducer's "attempting to exceed
+            // the max dequeued buffer count" means a dequeued slot was never queued
+            // back. Only the first is recoverable by posting.
+            let mut post_res = None;
+            if locked == -38 && self.holds_lock {
+                post_res = Some(unsafe { ANativeWindow_unlockAndPost(self.native_window) });
             }
             let fails = self.fail_count;
             self.fail_count += 1;
-            if fails < 5 || fails % 30 == 0 {
-                logging::info(&format!(
-                    "preview: ANativeWindow_lock failed: {} (bits={:?}, fails={})",
-                    locked, buffer.bits, fails + 1
-                ));
-            }
+            logging::info(&format!(
+                "preview: lock failed: code={} bits={:?} fails={} lock_ms={} holds_lock={} post={:?} frames={}",
+                locked, buffer.bits, fails + 1, lock_ms, self.holds_lock, post_res, self.frames
+            ));
             return -3;
         }
         self.fail_count = 0;
+        self.holds_lock = true;
+        if self.frames == 0 {
+            logging::info(&format!(
+                "preview: first lock ok: {}x{} stride {} format {}",
+                buffer.width, buffer.height, buffer.stride, buffer.format
+            ));
+        }
 
         let bw = buffer.width;
         let bh = buffer.height;
         let stride = buffer.stride;
         if bw <= 0 || bh <= 0 || stride <= 0 {
             let res = unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+            self.holds_lock = false;
             if res != 0 {
                 logging::error(&format!("preview: unlockAndPost err: {}", res));
             }
@@ -727,6 +743,9 @@ impl SurfaceBridge {
             row_uv_offs[dx] = (s_row >> 1) * width as usize;
         }
 
+        // The preview is mirrored (selfie-style): the front camera's raw frame is
+        // a direct view of the user, but a mirror reads naturally. Only the
+        // display is flipped; the algorithm keeps the un-mirrored sensor frame.
         if buffer.format == 4 {
             // WINDOW_FORMAT_RGB_565
             let dst = buffer.bits as *mut u16;
@@ -742,7 +761,7 @@ impl SurfaceBridge {
                     let u_val = vu_plane[uv_idx + 1];
                     let (r, g, b) = yuv_to_rgb(y_val, u_val, v_val);
                     unsafe {
-                        *dst_row.add(dx) =
+                        *dst_row.add((bw as usize - 1) - dx) =
                             (((r >> 3) as u16) << 11) | (((g >> 2) as u16) << 5) | ((b >> 3) as u16);
                     }
                 }
@@ -762,7 +781,7 @@ impl SurfaceBridge {
                     let u_val = vu_plane[uv_idx + 1];
                     let (r, g, b) = yuv_to_rgb(y_val, u_val, v_val);
                     unsafe {
-                        *dst_row.add(dx) =
+                        *dst_row.add((bw as usize - 1) - dx) =
                             0xFF00_0000 | ((b as u32) << 16) | ((g as u32) << 8) | r as u32;
                     }
                 }
@@ -770,6 +789,7 @@ impl SurfaceBridge {
         }
 
         let post_res = unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+        self.holds_lock = false;
         if post_res != 0 {
             logging::error(&format!("preview: ANativeWindow_unlockAndPost failed: {}", post_res));
         }
