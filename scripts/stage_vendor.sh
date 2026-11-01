@@ -21,6 +21,13 @@ RED=$'\033[1;31m'; GRN=$'\033[1;32m'; YEL=$'\033[1;33m'; NC=$'\033[0m'
 SRC="$HERE/target/aarch64-linux-android/release/face-hal-service"
 [[ -f "$SRC" ]] || { echo -e "${RED}no built binary — run scripts/build.sh first${NC}"; exit 1; }
 
+# The unpacked ROM tree is a sibling checkout, not part of this repository.
+[[ -d "$VENDOR" ]] || {
+    echo -e "${RED}no vendor tree at $VENDOR${NC}"
+    echo "  set ROM_TREE to the unpacked tree this HAL is staged into"
+    exit 1
+}
+
 HAL_NAME="android.hardware.biometrics.face-service.example"
 RC_NAME="android.hardware.biometrics.face-service.rc"
 FQNAME="android.hardware.biometrics.face.IFace/default"

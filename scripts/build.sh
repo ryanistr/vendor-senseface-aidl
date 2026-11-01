@@ -56,6 +56,15 @@ echo -e "${GRN}UND symbols from our own libs${NC}"
 readelf --dyn-syms "$BIN" | awk '$7=="UND" && $8 ~ /^st_/ {print "  "$8}' | sort -u
 
 echo
+# The ROM tree is a sibling checkout, not part of this repository. Skip the
+# resolution check when it is absent rather than failing a build that is fine.
+ROM_TREE="${ROM_TREE:-$HERE/../../erofs}"
+if [[ ! -d "$ROM_TREE" ]]; then
+    echo -e "${YEL}no ROM tree at $ROM_TREE, skipping the DT_NEEDED resolution check${NC}"
+    echo "  set ROM_TREE to check the libraries against an unpacked tree"
+    exit 0
+fi
+
 echo -e "${GRN}verifying every DT_NEEDED resolves in the ROM tree...${NC}"
 # Bionic core libs ship in /apex/com.android.runtime (not in any partition dir
 # of the unpacked tree) and are provided by the linker itself, so they are
@@ -65,10 +74,10 @@ fail=0
 while read -r lib; do
     if [[ "$lib" =~ $BIONIC_CORE ]]; then
         echo "  OK   $lib (bionic core / runtime apex)"
-    elif [[ -f "$HERE/../../erofs/vendor/lib64/$lib" ]]; then
+    elif [[ -f "$ROM_TREE/vendor/lib64/$lib" ]]; then
         echo "  OK   $lib (vendor/lib64)"
-    elif [[ -f "$HERE/../../erofs/system/system/lib64/$lib" ]]; then
-        if grep -qx "$lib" "$HERE/../../erofs/system/system/etc/llndk.libraries.txt" 2>/dev/null; then
+    elif [[ -f "$ROM_TREE/system/system/lib64/$lib" ]]; then
+        if grep -qx "$lib" "$ROM_TREE/system/system/etc/llndk.libraries.txt" 2>/dev/null; then
             echo "  OK   $lib (llndk)"
         else
             echo "  WARN $lib present in /system/lib64 but NOT llndk — vendor namespace may not resolve it"
