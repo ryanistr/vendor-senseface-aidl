@@ -623,16 +623,6 @@ impl SurfaceBridge {
         };
         logging::info(&format!("preview: ANativeWindow_setBuffersGeometry(480, 480, RGBA_8888) ret={}", geom));
 
-        let libnative = load_lib(&["libnativewindow.so", "/system/lib64/libnativewindow.so"]);
-        if let Some(h) = libnative {
-            type FnSetDequeueTimeout = unsafe extern "C" fn(*mut c_void, i64) -> i32;
-            if let Some(sym) = symbol(h, "ANativeWindow_setDequeueTimeout") {
-                let fn_timeout: FnSetDequeueTimeout = unsafe { std::mem::transmute(sym) };
-                let ret = unsafe { fn_timeout(anw, 50_000_000) };
-                logging::info(&format!("preview: ANativeWindow_setDequeueTimeout(50ms) ret={}", ret));
-            }
-        }
-
         logging::info("preview: surface bridge successfully established via libbufferqueueconverter");
 
         Some(SurfaceBridge {
@@ -664,31 +654,18 @@ impl SurfaceBridge {
             reserved: [0; 6],
         };
         let t_lock = std::time::Instant::now();
-        let mut locked = unsafe { ANativeWindow_lock(self.native_window, &mut buffer, ptr::null_mut()) };
+        let locked = unsafe { ANativeWindow_lock(self.native_window, &mut buffer, ptr::null_mut()) };
         let lock_ms = t_lock.elapsed().as_millis();
         if locked != 0 || buffer.bits.is_null() {
-            // -38 (INVALID_OPERATION) from libgui Surface::lock means mLockedBuffer
-            // was left locked (e.g. during an in-flight resize/clip animation like
-            // MaskTranslationView's animatePreviewRectToRound). Attempt unlockAndPost
-            // to unwedge mLockedBuffer and retry once if it succeeded.
-            let mut post_res = None;
-            if locked == -38 && (self.holds_lock || self.fail_count < 3) {
-                let res = unsafe { ANativeWindow_unlockAndPost(self.native_window) };
-                post_res = Some(res);
-                self.holds_lock = false;
-                if res == 0 {
-                    locked = unsafe { ANativeWindow_lock(self.native_window, &mut buffer, ptr::null_mut()) };
-                }
-            }
-            if locked != 0 || buffer.bits.is_null() {
-                let fails = self.fail_count;
-                self.fail_count += 1;
+            let fails = self.fail_count;
+            self.fail_count += 1;
+            if fails < 5 || fails % 30 == 0 {
                 logging::info(&format!(
-                    "preview: lock failed: code={} bits={:?} fails={} lock_ms={} holds_lock={} post={:?} frames={}",
-                    locked, buffer.bits, fails + 1, lock_ms, self.holds_lock, post_res, self.frames
+                    "preview: lock failed: code={} bits={:?} fails={} lock_ms={} frames={}",
+                    locked, buffer.bits, fails + 1, lock_ms, self.frames
                 ));
-                return -3;
             }
+            return -3;
         }
         self.fail_count = 0;
         self.holds_lock = true;
@@ -813,6 +790,10 @@ impl SurfaceBridge {
 
 impl Drop for SurfaceBridge {
     fn drop(&mut self) {
+        if self.holds_lock && !self.native_window.is_null() {
+            unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+            self.holds_lock = false;
+        }
         if !self.holder.is_null() {
             if let Some(destroy) = self.fn_destroy {
                 unsafe { destroy(self.holder) };
