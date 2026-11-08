@@ -664,25 +664,31 @@ impl SurfaceBridge {
             reserved: [0; 6],
         };
         let t_lock = std::time::Instant::now();
-        let locked = unsafe { ANativeWindow_lock(self.native_window, &mut buffer, ptr::null_mut()) };
+        let mut locked = unsafe { ANativeWindow_lock(self.native_window, &mut buffer, ptr::null_mut()) };
         let lock_ms = t_lock.elapsed().as_millis();
         if locked != 0 || buffer.bits.is_null() {
-            // -38 (INVALID_OPERATION) means one of two very different things, and the
-            // recovery differs: libgui's "already locked" means Surface::lock saw a
-            // stale mLockedBuffer, while BufferQueueProducer's "attempting to exceed
-            // the max dequeued buffer count" means a dequeued slot was never queued
-            // back. Only the first is recoverable by posting.
+            // -38 (INVALID_OPERATION) from libgui Surface::lock means mLockedBuffer
+            // was left locked (e.g. during an in-flight resize/clip animation like
+            // MaskTranslationView's animatePreviewRectToRound). Attempt unlockAndPost
+            // to unwedge mLockedBuffer and retry once if it succeeded.
             let mut post_res = None;
-            if locked == -38 && self.holds_lock {
-                post_res = Some(unsafe { ANativeWindow_unlockAndPost(self.native_window) });
+            if locked == -38 && (self.holds_lock || self.fail_count < 3) {
+                let res = unsafe { ANativeWindow_unlockAndPost(self.native_window) };
+                post_res = Some(res);
+                self.holds_lock = false;
+                if res == 0 {
+                    locked = unsafe { ANativeWindow_lock(self.native_window, &mut buffer, ptr::null_mut()) };
+                }
             }
-            let fails = self.fail_count;
-            self.fail_count += 1;
-            logging::info(&format!(
-                "preview: lock failed: code={} bits={:?} fails={} lock_ms={} holds_lock={} post={:?} frames={}",
-                locked, buffer.bits, fails + 1, lock_ms, self.holds_lock, post_res, self.frames
-            ));
-            return -3;
+            if locked != 0 || buffer.bits.is_null() {
+                let fails = self.fail_count;
+                self.fail_count += 1;
+                logging::info(&format!(
+                    "preview: lock failed: code={} bits={:?} fails={} lock_ms={} holds_lock={} post={:?} frames={}",
+                    locked, buffer.bits, fails + 1, lock_ms, self.holds_lock, post_res, self.frames
+                ));
+                return -3;
+            }
         }
         self.fail_count = 0;
         self.holds_lock = true;
