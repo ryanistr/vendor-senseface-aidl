@@ -618,10 +618,57 @@ impl SurfaceBridge {
         }
         logging::info(&format!("preview: validated ANativeWindow at {:#x}", anw as usize));
 
+        let libnative = load_lib(&["libnativewindow.so", "/system/lib64/libnativewindow.so"]);
+        let mut target_w = 480;
+        let mut target_h = 480;
+        if let Some(h) = libnative {
+            type FnGetDim = unsafe extern "C" fn(*mut c_void) -> i32;
+            type FnSetAutoRefresh = unsafe extern "C" fn(*mut c_void, i32) -> i32;
+            type FnSetBufferCount = unsafe extern "C" fn(*mut c_void, usize) -> i32;
+            type FnSetDequeueTimeout = unsafe extern "C" fn(*mut c_void, i64) -> i32;
+
+            if let Some(sym) = symbol(h, "ANativeWindow_getWidth") {
+                let fn_w: FnGetDim = unsafe { std::mem::transmute(sym) };
+                let w = unsafe { fn_w(anw) };
+                if w > 0 {
+                    target_w = w;
+                }
+            }
+            if let Some(sym) = symbol(h, "ANativeWindow_getHeight") {
+                let fn_h: FnGetDim = unsafe { std::mem::transmute(sym) };
+                let h = unsafe { fn_h(anw) };
+                if h > 0 {
+                    target_h = h;
+                }
+            }
+            logging::info(&format!("preview: detected window dimensions {}x{}", target_w, target_h));
+
+            if let Some(sym) = symbol(h, "ANativeWindow_setAutoRefresh") {
+                let fn_auto: FnSetAutoRefresh = unsafe { std::mem::transmute(sym) };
+                let ret = unsafe { fn_auto(anw, 1) };
+                logging::info(&format!("preview: ANativeWindow_setAutoRefresh(1) ret={}", ret));
+            }
+
+            if let Some(sym) = symbol(h, "ANativeWindow_setBufferCount") {
+                let fn_bc: FnSetBufferCount = unsafe { std::mem::transmute(sym) };
+                let ret = unsafe { fn_bc(anw, 8) };
+                logging::info(&format!("preview: ANativeWindow_setBufferCount(8) ret={}", ret));
+            }
+
+            if let Some(sym) = symbol(h, "ANativeWindow_setDequeueTimeout") {
+                let fn_timeout: FnSetDequeueTimeout = unsafe { std::mem::transmute(sym) };
+                let ret = unsafe { fn_timeout(anw, 1_000_000_000) };
+                logging::info(&format!("preview: ANativeWindow_setDequeueTimeout(1s) ret={}", ret));
+            }
+        }
+
         let geom = unsafe {
-            ANativeWindow_setBuffersGeometry(anw, 480, 480, 1)
+            ANativeWindow_setBuffersGeometry(anw, target_w, target_h, 1)
         };
-        logging::info(&format!("preview: ANativeWindow_setBuffersGeometry(480, 480, RGBA_8888) ret={}", geom));
+        logging::info(&format!(
+            "preview: ANativeWindow_setBuffersGeometry({}, {}, RGBA_8888) ret={}",
+            target_w, target_h, geom
+        ));
 
         logging::info("preview: surface bridge successfully established via libbufferqueueconverter");
 
@@ -641,7 +688,7 @@ impl SurfaceBridge {
             return -1;
         }
 
-        if self.last_post.elapsed() < std::time::Duration::from_millis(28) {
+        if self.last_post.elapsed() < std::time::Duration::from_millis(10) {
             return 0;
         }
 
